@@ -385,3 +385,115 @@ export async function getCurrentUser(): Promise<{ name: string; email: string } 
   }
   return null
 }
+
+/**
+ * Call the Provenance Detect API using API Key authentication
+ * @param detectUrl The Content Safety detect endpoint URL
+ * @param apiKey The Content Safety API key
+ * @param audioData The audio data as ArrayBuffer
+ * @param mimeType The MIME type of the audio (e.g., 'audio/wav', 'audio/mpeg')
+ */
+export async function detectWatermarkWithKey(
+  detectUrl: string,
+  apiKey: string,
+  audioData: ArrayBuffer,
+  mimeType: string = 'audio/wav'
+): Promise<DetectResult> {
+  try {
+    // Convert audio data to base64
+    const base64Data = arrayBufferToBase64(audioData)
+    
+    // Build the detect request
+    const requestBody = {
+      mimeType: mimeType,
+      data: base64Data,
+    }
+    
+    // Call the detect API (remove trailing slash from URL if present)
+    const baseUrl = detectUrl.replace(/\/+$/, '')
+    const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Ocp-Apim-Subscription-Key': apiKey,
+      },
+      body: JSON.stringify(requestBody),
+    })
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      return {
+        status: 'Error',
+        error: `HTTP ${response.status}: ${errorText}`,
+      }
+    }
+    
+    const result = await response.json()
+    return {
+      status: result.status || 'Unknown',
+      publicUUID: result.publicUUID,
+      raw: result,
+    }
+  } catch (error: any) {
+    return {
+      status: 'Error',
+      error: error.message || 'Unknown error',
+    }
+  }
+}
+
+/**
+ * Call the Provenance Detect API using Bearer token authentication
+ * @param detectUrl The Content Safety detect endpoint URL
+ * @param token The Bearer access token (e.g., from az account get-access-token)
+ * @param audioData The audio data as ArrayBuffer
+ * @param mimeType The MIME type of the audio (e.g., 'audio/wav', 'audio/mpeg')
+ */
+export async function detectWatermarkWithToken(
+  detectUrl: string,
+  token: string,
+  audioData: ArrayBuffer,
+  mimeType: string = 'audio/wav'
+): Promise<DetectResult> {
+  try {
+    // Convert audio data to base64
+    const base64Data = arrayBufferToBase64(audioData)
+    
+    // Build the detect request
+    const requestBody = {
+      mimeType: mimeType,
+      data: base64Data,
+    }
+    
+    // Call the detect API (remove trailing slash from URL if present)
+    const baseUrl = detectUrl.replace(/\/+$/, '')
+    const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(requestBody),
+    })
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      return {
+        status: 'Error',
+        error: `HTTP ${response.status}: ${errorText}`,
+      }
+    }
+    
+    const result = await response.json()
+    return {
+      status: result.status || 'Unknown',
+      publicUUID: result.publicUUID,
+      raw: result,
+    }
+  } catch (error: any) {
+    return {
+      status: 'Error',
+      error: error.message || 'Unknown error',
+    }
+  }
+}

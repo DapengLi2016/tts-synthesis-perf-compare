@@ -13,11 +13,13 @@ export function ResultsSection({ results }: ResultsSectionProps) {
   const statsOff = {
     firstByte: calcStats(provOffResults, 'firstByteLatencyMs'),
     lastByte: calcStats(provOffResults, 'lastByteLatencyMs'),
+    maxRtf: calcStats(provOffResults, 'maxRtf'),
   }
 
   const statsOn = {
     firstByte: calcStats(provOnResults, 'firstByteLatencyMs'),
     lastByte: calcStats(provOnResults, 'lastByteLatencyMs'),
+    maxRtf: calcStats(provOnResults, 'maxRtf'),
   }
 
   const deltaFirstByte = statsOn.firstByte.avg - statsOff.firstByte.avg
@@ -38,18 +40,23 @@ export function ResultsSection({ results }: ResultsSectionProps) {
   }
 
   const metrics = [
-    { name: 'First Byte Avg', offVal: statsOff.firstByte.avg, onVal: statsOn.firstByte.avg },
-    { name: 'First Byte P50', offVal: statsOff.firstByte.p50, onVal: statsOn.firstByte.p50 },
-    { name: 'First Byte P95', offVal: statsOff.firstByte.p95, onVal: statsOn.firstByte.p95 },
-    { name: 'First Byte P99', offVal: statsOff.firstByte.p99, onVal: statsOn.firstByte.p99 },
-    { name: 'First Byte Min', offVal: statsOff.firstByte.min, onVal: statsOn.firstByte.min },
-    { name: 'First Byte Max', offVal: statsOff.firstByte.max, onVal: statsOn.firstByte.max },
-    { name: 'Last Byte Avg', offVal: statsOff.lastByte.avg, onVal: statsOn.lastByte.avg },
-    { name: 'Last Byte P50', offVal: statsOff.lastByte.p50, onVal: statsOn.lastByte.p50 },
-    { name: 'Last Byte P95', offVal: statsOff.lastByte.p95, onVal: statsOn.lastByte.p95 },
-    { name: 'Last Byte P99', offVal: statsOff.lastByte.p99, onVal: statsOn.lastByte.p99 },
-    { name: 'Last Byte Min', offVal: statsOff.lastByte.min, onVal: statsOn.lastByte.min },
-    { name: 'Last Byte Max', offVal: statsOff.lastByte.max, onVal: statsOn.lastByte.max },
+    { name: 'First Byte Avg', offVal: statsOff.firstByte.avg, onVal: statsOn.firstByte.avg, unit: 'ms' },
+    { name: 'First Byte P50', offVal: statsOff.firstByte.p50, onVal: statsOn.firstByte.p50, unit: 'ms' },
+    { name: 'First Byte P95', offVal: statsOff.firstByte.p95, onVal: statsOn.firstByte.p95, unit: 'ms' },
+    { name: 'First Byte P99', offVal: statsOff.firstByte.p99, onVal: statsOn.firstByte.p99, unit: 'ms' },
+    { name: 'First Byte Min', offVal: statsOff.firstByte.min, onVal: statsOn.firstByte.min, unit: 'ms' },
+    { name: 'First Byte Max', offVal: statsOff.firstByte.max, onVal: statsOn.firstByte.max, unit: 'ms' },
+    { name: 'Last Byte Avg', offVal: statsOff.lastByte.avg, onVal: statsOn.lastByte.avg, unit: 'ms' },
+    { name: 'Last Byte P50', offVal: statsOff.lastByte.p50, onVal: statsOn.lastByte.p50, unit: 'ms' },
+    { name: 'Last Byte P95', offVal: statsOff.lastByte.p95, onVal: statsOn.lastByte.p95, unit: 'ms' },
+    { name: 'Last Byte P99', offVal: statsOff.lastByte.p99, onVal: statsOn.lastByte.p99, unit: 'ms' },
+    { name: 'Last Byte Min', offVal: statsOff.lastByte.min, onVal: statsOn.lastByte.min, unit: 'ms' },
+    { name: 'Last Byte Max', offVal: statsOff.lastByte.max, onVal: statsOn.lastByte.max, unit: 'ms' },
+    { name: 'Max RTF Avg', offVal: statsOff.maxRtf.avg, onVal: statsOn.maxRtf.avg, unit: '' },
+    { name: 'Max RTF P50', offVal: statsOff.maxRtf.p50, onVal: statsOn.maxRtf.p50, unit: '' },
+    { name: 'Max RTF P95', offVal: statsOff.maxRtf.p95, onVal: statsOn.maxRtf.p95, unit: '' },
+    { name: 'Max RTF P99', offVal: statsOff.maxRtf.p99, onVal: statsOn.maxRtf.p99, unit: '' },
+    { name: 'Max RTF Max', offVal: statsOff.maxRtf.max, onVal: statsOn.maxRtf.max, unit: '' },
   ]
 
   const handleDownloadJson = () => {
@@ -93,6 +100,12 @@ export function ResultsSection({ results }: ResultsSectionProps) {
               <span className="font-mono font-semibold">{statsOff.lastByte.avg.toFixed(1)} ms</span>
             </div>
             <div className="flex justify-between">
+              <span className="text-gray-500">Max RTF P95:</span>
+              <span className={`font-mono font-semibold ${statsOff.maxRtf.p95 > 0.8 ? 'text-red-600' : 'text-green-600'}`}>
+                {statsOff.maxRtf.p95.toFixed(3)}
+              </span>
+            </div>
+            <div className="flex justify-between">
               <span className="text-gray-500">Samples:</span>
               <span className="font-mono font-semibold">{provOffResults.length}</span>
             </div>
@@ -110,6 +123,12 @@ export function ResultsSection({ results }: ResultsSectionProps) {
             <div className="flex justify-between">
               <span className="text-gray-500">Avg Last Byte:</span>
               <span className="font-mono font-semibold">{statsOn.lastByte.avg.toFixed(1)} ms</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-gray-500">Max RTF P95:</span>
+              <span className={`font-mono font-semibold ${statsOn.maxRtf.p95 > 0.8 ? 'text-red-600' : 'text-green-600'}`}>
+                {statsOn.maxRtf.p95.toFixed(3)}
+              </span>
             </div>
             <div className="flex justify-between">
               <span className="text-gray-500">Samples:</span>
@@ -161,13 +180,16 @@ export function ResultsSection({ results }: ResultsSectionProps) {
             {metrics.map(m => {
               const delta = m.onVal - m.offVal
               const pct = m.offVal > 0 ? (delta / m.offVal * 100) : 0
+              const unit = m.unit || ''
+              const isRtf = m.name.includes('RTF')
+              const precision = isRtf ? 3 : 1
               return (
                 <tr key={m.name} className="hover:bg-gray-50">
                   <td className="p-2 border-b">{m.name}</td>
-                  <td className="p-2 border-b font-mono">{m.offVal.toFixed(1)} ms</td>
-                  <td className="p-2 border-b font-mono">{m.onVal.toFixed(1)} ms</td>
+                  <td className="p-2 border-b font-mono">{m.offVal.toFixed(precision)}{unit ? ` ${unit}` : ''}</td>
+                  <td className="p-2 border-b font-mono">{m.onVal.toFixed(precision)}{unit ? ` ${unit}` : ''}</td>
                   <td className={`p-2 border-b font-mono ${delta > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                    {delta >= 0 ? '+' : ''}{delta.toFixed(1)} ms
+                    {delta >= 0 ? '+' : ''}{delta.toFixed(precision)}{unit ? ` ${unit}` : ''}
                   </td>
                   <td className={`p-2 border-b font-mono ${Math.abs(pct) > 5 ? 'text-red-600 font-semibold' : 'text-green-600'}`}>
                     {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%

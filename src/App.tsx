@@ -7,8 +7,9 @@ import { AudioList } from './components/AudioList'
 import { LogSection } from './components/LogSection'
 import { generateSsmls, SsmlData } from './utils/ssmlGenerator'
 import { runPerformanceTest, runWarmup, TestResult } from './utils/synthesizer'
+import { detectWatermarkWithKey, detectWatermarkWithToken, DetectResult } from './utils/detect'
 import { LogEntry } from './types'
-import { loadConfig, saveConfig, clearConfig, TestMode } from './utils/storage'
+import { loadConfig, saveConfig, clearConfig, TestMode, DetectAuthType } from './utils/storage'
 
 /**
  * Parse URL parameters to override config.
@@ -97,6 +98,7 @@ function App() {
   const [region, setRegion] = useState(urlParams.region || savedConfig.region || 'eastus')
   const [customEndpoint, setCustomEndpoint] = useState(urlParams.endpoint || savedConfig.customEndpoint || 'ws://localhost:12345/cognitiveservices/websocket/v1')
   const [subscriptionKey, setSubscriptionKey] = useState(urlParams.key || savedConfig.subscriptionKey || '')
+  const [accessToken, setAccessToken] = useState(savedConfig.accessToken || '')
   const [voiceName, setVoiceName] = useState(urlParams.voice || savedConfig.voiceName || 'en-US-AvaNeural')
   const [outputFormat, setOutputFormat] = useState(urlParams.format || savedConfig.outputFormat || 'riff-24khz-16bit-mono-pcm')
   const [ssmlCount, setSsmlCount] = useState(urlParams.ssmlCount || savedConfig.ssmlCount || 50)
@@ -104,8 +106,15 @@ function App() {
   const [warmupRuns, setWarmupRuns] = useState(urlParams.warmup ?? savedConfig.warmupRuns ?? 1)
   const [enableCache, setEnableCache] = useState(savedConfig.enableCache ?? true)
   const [detectUrl, setDetectUrl] = useState(savedConfig.detectUrl || '')
+  const [detectAuthType, setDetectAuthType] = useState<DetectAuthType>(savedConfig.detectAuthType || 'apiKey')
+  const [detectToken, setDetectToken] = useState(savedConfig.detectToken || '')
+  const [verifyWatermark, setVerifyWatermark] = useState(savedConfig.verifyWatermark ?? false)
   const [testMode, setTestMode] = useState<TestMode>(urlParams.testMode || savedConfig.testMode || 'both')
   const [useHttpApi, setUseHttpApi] = useState(urlParams.useHttpApi ?? savedConfig.useHttpApi ?? false)
+  
+  // SSML options
+  const [useMultiVoice, setUseMultiVoice] = useState(savedConfig.useMultiVoice ?? true)
+  const [backgroundAudioUrl, setBackgroundAudioUrl] = useState(savedConfig.backgroundAudioUrl || '')
 
   // SSML state
   const [ssmls, setSsmls] = useState<SsmlData[]>([])
@@ -116,6 +125,9 @@ function App() {
   const [currentTest, setCurrentTest] = useState('')
   const [results, setResults] = useState<TestResult[]>([])
   const [logs, setLogs] = useState<LogEntry[]>([])
+  const [isVerifying, setIsVerifying] = useState(false)
+  const [verifyProgress, setVerifyProgress] = useState({ current: 0, total: 0 })
+  const [autoDetectResults, setAutoDetectResults] = useState<Record<string, DetectResult>>({})
 
   // Abort controller for stopping tests
   const [abortController, setAbortController] = useState<AbortController | null>(null)
@@ -128,6 +140,7 @@ function App() {
         region,
         customEndpoint,
         subscriptionKey,
+        accessToken,
         voiceName,
         outputFormat,
         ssmlCount,
@@ -135,11 +148,16 @@ function App() {
         warmupRuns,
         enableCache,
         detectUrl,
+        detectAuthType,
+        detectToken,
+        verifyWatermark,
         testMode,
         useHttpApi,
+        useMultiVoice,
+        backgroundAudioUrl,
       })
     }
-  }, [endpointType, region, customEndpoint, subscriptionKey, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, enableCache, detectUrl, testMode, useHttpApi])
+  }, [endpointType, region, customEndpoint, subscriptionKey, accessToken, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, enableCache, detectUrl, detectAuthType, detectToken, verifyWatermark, testMode, useHttpApi, useMultiVoice, backgroundAudioUrl])
 
   const addLog = useCallback((message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
     setLogs(prev => [...prev, { timestamp: new Date(), message, type }])
@@ -165,6 +183,7 @@ function App() {
     setRegion('eastus')
     setCustomEndpoint('ws://localhost:12345/cognitiveservices/websocket/v1')
     setSubscriptionKey('')
+    setAccessToken('')
     setVoiceName('en-US-AvaNeural')
     setOutputFormat('riff-24khz-16bit-mono-pcm')
     setSsmlCount(50)
@@ -172,15 +191,26 @@ function App() {
     setWarmupRuns(1)
     setEnableCache(true)
     setDetectUrl('')
+    setDetectAuthType('apiKey')
+    setDetectToken('')
+    setVerifyWatermark(false)
     setTestMode('both')
+    setUseMultiVoice(true)
+    setBackgroundAudioUrl('')
     addLog('🗑️ Cache cleared', 'info')
   }, [addLog])
 
   const handleGenerateSsmls = useCallback(() => {
-    const generated = generateSsmls(ssmlCount, voiceName)
+    const generated = generateSsmls({
+      count: ssmlCount,
+      voiceName,
+      useMultiVoice,
+      backgroundAudioUrl: backgroundAudioUrl || undefined,
+    })
     setSsmls(generated)
-    addLog(`✅ Generated ${generated.length} SSMLs with voice: ${voiceName}`, 'success')
-  }, [ssmlCount, voiceName, addLog])
+    const bgmInfo = backgroundAudioUrl ? `, BGM: enabled` : ''
+    addLog(`✅ Generated ${generated.length} SSMLs with voice: ${voiceName}, Multi-voice: ${useMultiVoice}${bgmInfo}`, 'success')
+  }, [ssmlCount, voiceName, useMultiVoice, backgroundAudioUrl, addLog])
 
   const handleStartTest = useCallback(async () => {
     if (!subscriptionKey) {
@@ -195,11 +225,27 @@ function App() {
       addLog('❌ Please enter a custom endpoint', 'error')
       return
     }
+    // Check authentication for watermark verification
+    if (verifyWatermark) {
+      if (detectAuthType === 'token' && !accessToken) {
+        addLog('❌ Watermark verification requires Access Token (please fill in the Access Token field above)', 'error')
+        return
+      }
+      if (detectAuthType === 'apiKey' && !detectToken) {
+        addLog('❌ Watermark verification requires Detect API Key', 'error')
+        return
+      }
+      if (!detectUrl) {
+        addLog('❌ Watermark verification is enabled but no Detect URL provided', 'error')
+        return
+      }
+    }
 
     const controller = new AbortController()
     setAbortController(controller)
     setIsRunning(true)
     setResults([])
+    setAutoDetectResults({})
     setProgress(0)
 
     const endpoint = endpointType === 'custom' ? customEndpoint : null
@@ -208,6 +254,12 @@ function App() {
     addLog(`🚀 Starting performance test...`, 'info')
     addLog(`📊 Configuration: ${endpointType === 'custom' ? `Custom: ${customEndpoint}` : `Region: ${region}`}`, 'info')
     addLog(`📝 SSMLs: ${ssmls.length}, Iterations: ${iterations}, Warmup: ${warmupRuns}`, 'info')
+    if (verifyWatermark) {
+      addLog(`🔍 Watermark verification: ENABLED`, 'info')
+    }
+
+    // Collect results during test for verification
+    const collectedResults: TestResult[] = []
 
     try {
       // Run warmup first
@@ -238,6 +290,7 @@ function App() {
           setCurrentTest(label)
         },
         onResult: (result) => {
+          collectedResults.push(result)
           setResults(prev => [...prev, result])
           const status = result.success ? '✓' : '✗'
           const logType = result.success ? 'success' : 'error'
@@ -250,6 +303,64 @@ function App() {
       })
 
       addLog('✅ Performance test completed!', 'success')
+
+      // Run watermark verification if enabled
+      // Check if we have the required token based on auth type
+      const hasRequiredToken = detectAuthType === 'token' ? !!accessToken : !!detectToken
+      if (verifyWatermark && detectUrl && hasRequiredToken) {
+        const provOnResults = collectedResults.filter(r => r.success && r.provenanceEnabled && r.audioData)
+        if (provOnResults.length > 0) {
+          setIsVerifying(true)
+          setVerifyProgress({ current: 0, total: provOnResults.length })
+          addLog(`🔍 Starting watermark verification for ${provOnResults.length} audio files...`, 'info')
+
+          // Determine MIME type from output format
+          const mimeType = outputFormat.includes('mp3') ? 'audio/mpeg' : 'audio/wav'
+
+          let verified = 0
+          let failed = 0
+
+          for (let i = 0; i < provOnResults.length; i++) {
+            const result = provOnResults[i]
+            setVerifyProgress({ current: i + 1, total: provOnResults.length })
+            setCurrentTest(`Verifying SSML ${result.ssmlIndex} (${i + 1}/${provOnResults.length})`)
+
+            try {
+              // Use accessToken for Bearer auth, detectToken for API Key auth
+              const detectResult: DetectResult = detectAuthType === 'token'
+                ? await detectWatermarkWithToken(detectUrl, accessToken, result.audioData!, mimeType)
+                : await detectWatermarkWithKey(detectUrl, detectToken, result.audioData!, mimeType)
+
+              // Store the detect result for AudioList
+              const key = `${result.ssmlIndex}-${result.iteration}-${result.provenanceEnabled}`
+              setAutoDetectResults(prev => ({ ...prev, [key]: detectResult }))
+
+              if (detectResult.status === 'Detected' || detectResult.status === 'Success' || detectResult.status === 'SuccessByWatermarkExtraction') {
+                verified++
+                addLog(`✅ SSML ${result.ssmlIndex}: Watermark detected (UUID: ${detectResult.publicUUID || 'N/A'})`, 'success')
+              } else if (detectResult.status === 'Error') {
+                failed++
+                addLog(`❌ SSML ${result.ssmlIndex}: Detection error - ${detectResult.error}`, 'error')
+              } else {
+                failed++
+                addLog(`⚠️ SSML ${result.ssmlIndex}: Watermark NOT detected (status: ${detectResult.status})`, 'warning')
+              }
+            } catch (error: any) {
+              failed++
+              addLog(`❌ SSML ${result.ssmlIndex}: Detection failed - ${error.message}`, 'error')
+              // Store error result for AudioList
+              const key = `${result.ssmlIndex}-${result.iteration}-${result.provenanceEnabled}`
+              setAutoDetectResults(prev => ({ ...prev, [key]: { status: 'Error', error: error.message } }))
+            }
+          }
+
+          addLog(`🔍 Verification complete: ${verified} verified, ${failed} failed out of ${provOnResults.length}`, 
+            failed === 0 ? 'success' : 'warning')
+          setIsVerifying(false)
+        } else {
+          addLog('⚠️ No provenance-enabled audio to verify', 'warning')
+        }
+      }
     } catch (error: any) {
       if (error.name === 'AbortError') {
         addLog('⚠️ Test stopped by user', 'warning')
@@ -258,10 +369,11 @@ function App() {
       }
     } finally {
       setIsRunning(false)
+      setIsVerifying(false)
       setAbortController(null)
       setCurrentTest('')
     }
-  }, [subscriptionKey, ssmls, endpointType, customEndpoint, region, iterations, warmupRuns, outputFormat, testMode, useHttpApi, addLog])
+  }, [subscriptionKey, accessToken, ssmls, endpointType, customEndpoint, region, iterations, warmupRuns, outputFormat, testMode, useHttpApi, verifyWatermark, detectUrl, detectAuthType, detectToken, addLog])
 
   const handleStopTest = useCallback(() => {
     abortController?.abort()
@@ -290,6 +402,8 @@ function App() {
           setCustomEndpoint={setCustomEndpoint}
           subscriptionKey={subscriptionKey}
           setSubscriptionKey={setSubscriptionKey}
+          accessToken={accessToken}
+          setAccessToken={setAccessToken}
           voiceName={voiceName}
           setVoiceName={setVoiceName}
           outputFormat={outputFormat}
@@ -304,14 +418,25 @@ function App() {
           setEnableCache={setEnableCache}
           detectUrl={detectUrl}
           setDetectUrl={setDetectUrl}
+          detectAuthType={detectAuthType}
+          setDetectAuthType={setDetectAuthType}
+          detectToken={detectToken}
+          setDetectToken={setDetectToken}
+          verifyWatermark={verifyWatermark}
+          setVerifyWatermark={setVerifyWatermark}
           testMode={testMode}
           setTestMode={setTestMode}
           useHttpApi={useHttpApi}
           setUseHttpApi={setUseHttpApi}
+          useMultiVoice={useMultiVoice}
+          setUseMultiVoice={setUseMultiVoice}
+          backgroundAudioUrl={backgroundAudioUrl}
+          setBackgroundAudioUrl={setBackgroundAudioUrl}
           onGenerateSsmls={handleGenerateSsmls}
           onStartTest={handleStartTest}
           onStopTest={handleStopTest}
           onClearCache={handleClearCache}
+          onLog={addLog}
           isRunning={isRunning}
           hasSsmls={ssmls.length > 0}
         />
@@ -320,18 +445,22 @@ function App() {
         <SsmlPreview ssmls={ssmls} />
 
         {/* Progress */}
-        {isRunning && (
-          <ProgressSection progress={progress} currentTest={currentTest} />
+        {(isRunning || isVerifying) && (
+          <ProgressSection 
+            progress={isVerifying ? (verifyProgress.current / verifyProgress.total) * 100 : progress} 
+            currentTest={isVerifying ? `🔍 Verifying: ${currentTest}` : currentTest}
+            isVerifying={isVerifying}
+          />
         )}
 
         {/* Results */}
-        {results.length > 0 && !isRunning && (
+        {results.length > 0 && !isRunning && !isVerifying && (
           <ResultsSection results={results} />
         )}
 
         {/* Audio List */}
-        {results.length > 0 && !isRunning && (
-          <AudioList results={results} ssmls={ssmls} detectUrl={detectUrl} outputFormat={outputFormat} />
+        {results.length > 0 && !isRunning && !isVerifying && (
+          <AudioList results={results} ssmls={ssmls} detectUrl={detectUrl} outputFormat={outputFormat} autoDetectResults={autoDetectResults} />
         )}
 
         {/* Log */}

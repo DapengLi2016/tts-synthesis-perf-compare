@@ -37,7 +37,7 @@ export function downloadJson(data: object, filename: string): void {
 }
 
 export function downloadCsv(results: TestResult[], filename: string): void {
-  const headers = ['ssmlIndex', 'iteration', 'provenanceEnabled', 'firstByteLatencyMs', 'lastByteLatencyMs', 'totalBytes', 'chunkCount', 'success', 'error', 'timestamp']
+  const headers = ['ssmlIndex', 'iteration', 'provenanceEnabled', 'firstByteLatencyMs', 'lastByteLatencyMs', 'totalBytes', 'chunkCount', 'maxRtf', 'success', 'error', 'timestamp', 'requestId']
   const rows = results.map(r => headers.map(h => (r as any)[h] ?? '').join(','))
   const csv = [headers.join(','), ...rows].join('\n')
 

@@ -9,6 +9,7 @@ interface AudioListProps {
   ssmls: SsmlData[]
   detectUrl: string
   outputFormat: string
+  autoDetectResults?: Record<string, DetectResult>
 }
 
 interface AudioItemState {
@@ -17,7 +18,7 @@ interface AudioItemState {
   detectResult?: DetectResult
 }
 
-export function AudioList({ results, ssmls, detectUrl, outputFormat }: AudioListProps) {
+export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectResults }: AudioListProps) {
   const [expandedOff, setExpandedOff] = useState(false)
   const [expandedOn, setExpandedOn] = useState(false)
   const [audioStates, setAudioStates] = useState<Record<string, AudioItemState>>({})
@@ -29,6 +30,24 @@ export function AudioList({ results, ssmls, detectUrl, outputFormat }: AudioList
   const [copiedCommand, setCopiedCommand] = useState(false)
   const audioRefs = useRef<Record<string, HTMLAudioElement | null>>({})
   const audioUrlsRef = useRef<Record<string, string>>({})  // Cache blob URLs
+
+  // Initialize audioStates from autoDetectResults when available
+  useEffect(() => {
+    if (autoDetectResults && Object.keys(autoDetectResults).length > 0) {
+      setAudioStates(prev => {
+        const newStates = { ...prev }
+        for (const [key, detectResult] of Object.entries(autoDetectResults)) {
+          newStates[key] = {
+            ...newStates[key],
+            isPlaying: false,
+            isDetecting: false,
+            detectResult,
+          }
+        }
+        return newStates
+      })
+    }
+  }, [autoDetectResults])
 
   // Check user sign-in status
   useEffect(() => {

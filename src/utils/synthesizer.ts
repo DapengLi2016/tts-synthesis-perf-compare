@@ -10,6 +10,7 @@ export interface TestResult {
   lastByteLatencyMs?: number
   totalBytes?: number
   chunkCount?: number
+  maxRtf?: number  // Max Real-Time Factor: elapsed_time / audio_duration. If > 1.0, slower than playback
   audioData?: ArrayBuffer  // Store audio data for playback and detect
   success: boolean
   error?: string
@@ -48,6 +49,30 @@ type ProvenanceMode = boolean | undefined
 // Request parameter/header names (matching Frontend's RequestVariants and RequestHeaders)
 const PROVENANCE_QUERY_PARAM = 'provenance'  // URL query parameter for WebSocket SDK
 const PROVENANCE_HEADER = 'X-Microsoft-Provenance-Enabled'  // HTTP header for REST API
+
+/**
+ * Extract sample rate from output format string.
+ * Examples: 'raw-24khz-16bit-mono-pcm' -> 24000, 'audio-48khz-96kbitrate-mono-mp3' -> 48000
+ */
+function getSampleRateFromFormat(format: string): number {
+  const match = format.match(/(\d+)khz/i)
+  if (match) {
+    return parseInt(match[1]) * 1000
+  }
+  return 24000  // default fallback
+}
+
+/**
+ * Calculate RTF (Real-Time Factor) for audio streaming.
+ * RTF = elapsed_time_ms / audio_duration_ms
+ * If RTF > 1.0, audio generation is slower than playback speed.
+ */
+function calcRtf(sampleRate: number, cumulativeBytes: number, elapsedMs: number): number {
+  if (sampleRate <= 0 || cumulativeBytes <= 0) return 0
+  // audio_duration_ms = bytes / (2 * sampleRate) * 1000  (16-bit = 2 bytes per sample)
+  const audioMs = cumulativeBytes / (2 * sampleRate) * 1000
+  return audioMs > 0 ? elapsedMs / audioMs : 0
+}
 
 /**
  * Convert WebSocket endpoint to HTTP endpoint
@@ -112,6 +137,9 @@ async function synthesizeWithHttpApi(
   
   const audioData = await response.arrayBuffer()
   const lastByteTime = performance.now() - startTime
+  // Calculate RTF for the full response (HTTP only has one "chunk")
+  const sampleRate = getSampleRateFromFormat(outputFormat)
+  const maxRtf = calcRtf(sampleRate, audioData.byteLength, lastByteTime)
   
   return {
     success: true,
@@ -119,6 +147,7 @@ async function synthesizeWithHttpApi(
     lastByteLatencyMs: lastByteTime,
     totalBytes: audioData.byteLength,
     chunkCount: 1,  // HTTP returns full response
+    maxRtf,
     provenanceEnabled: provenanceMode === true,
     audioData,
     requestId,
@@ -128,22 +157,34 @@ async function synthesizeWithHttpApi(
 async function synthesizeWithLatencyTracking(
   speechConfig: SpeechSDK.SpeechConfig,
   ssml: string,
-  provenanceMode: ProvenanceMode
+  provenanceMode: ProvenanceMode,
+  outputFormat: string
 ): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp'>> {
   return new Promise((resolve, reject) => {
     const synthesizer = new SpeechSDK.SpeechSynthesizer(speechConfig, null as any)
+    const sampleRate = getSampleRateFromFormat(outputFormat)
 
     const startTime = performance.now()
     let firstByteTime: number | null = null
     let totalBytes = 0
     let chunkCount = 0
+    let maxRtf = 0
 
     synthesizer.synthesizing = (_s, e) => {
+      const elapsedMs = performance.now() - startTime
       if (firstByteTime === null && e.result.audioData && e.result.audioData.byteLength > 0) {
-        firstByteTime = performance.now() - startTime
+        firstByteTime = elapsedMs
       }
       totalBytes += e.result.audioData.byteLength
       chunkCount++
+      
+      // Calculate RTF for this cumulative point (skip first chunk)
+      if (chunkCount > 1) {
+        const rtf = calcRtf(sampleRate, totalBytes, elapsedMs)
+        if (rtf > maxRtf) {
+          maxRtf = rtf
+        }
+      }
     }
 
     synthesizer.speakSsmlAsync(
@@ -161,6 +202,7 @@ async function synthesizeWithLatencyTracking(
             lastByteLatencyMs: lastByteTime,
             totalBytes: result.audioData.byteLength,
             chunkCount,
+            maxRtf: maxRtf > 0 ? maxRtf : calcRtf(sampleRate, result.audioData.byteLength, lastByteTime),
             provenanceEnabled: provenanceMode === true,  // true only if explicitly set to true
             audioData: result.audioData.slice(0),  // Copy audio data
             requestId: result.resultId,  // SDK's resultId is the X-RequestId used in WebSocket messages
@@ -258,7 +300,7 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
 
             speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-            synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, provenanceMode)
+            synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, provenanceMode, outputFormat)
           }
 
           const result: TestResult = {
@@ -342,7 +384,7 @@ export async function runWarmup(options: WarmupOptions): Promise<void> {
 
         speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-        await synthesizeWithLatencyTracking(speechConfig, ssml, provenanceMode)
+        await synthesizeWithLatencyTracking(speechConfig, ssml, provenanceMode, outputFormat)
         onLog(`  ✓ Warmup ${i + 1}/${warmupRuns}, Prov=${provenanceMode ? 'ON' : 'OFF'}`)
       } catch (error: any) {
         onLog(`  ✗ Warmup ${i + 1}/${warmupRuns}, Prov=${provenanceMode ? 'ON' : 'OFF'}: ${error.message}`)

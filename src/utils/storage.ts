@@ -2,11 +2,14 @@ const STORAGE_KEY = 'tts-perf-compare-config'
 
 export type TestMode = 'default' | 'both' | 'provOff' | 'provOn'
 
+export type DetectAuthType = 'apiKey' | 'token'
+
 export interface ConfigData {
   endpointType?: 'region' | 'custom'
   region?: string
   customEndpoint?: string
   subscriptionKey?: string
+  accessToken?: string  // Optional Azure AD access token for user identity operations (detect API, storage SAS)
   voiceName?: string
   outputFormat?: string
   ssmlCount?: number
@@ -14,8 +17,14 @@ export interface ConfigData {
   warmupRuns?: number
   enableCache?: boolean
   detectUrl?: string
+  detectAuthType?: DetectAuthType  // 'apiKey' or 'token'
+  detectToken?: string  // API key or Access Token for detect API
+  verifyWatermark?: boolean  // Auto-verify watermark after synthesis completes
   testMode?: TestMode
   useHttpApi?: boolean  // Use HTTP REST API instead of WebSocket SDK (for provenance header)
+  // SSML options
+  useMultiVoice?: boolean  // true = 2 voice elements, false = 1 voice element
+  backgroundAudioUrl?: string  // optional background audio URL (with SAS token)
 }
 
 export function loadConfig(): ConfigData {

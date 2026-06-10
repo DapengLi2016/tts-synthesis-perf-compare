@@ -5,6 +5,13 @@ export interface SsmlData {
   secondaryText: string
 }
 
+export interface SsmlGeneratorOptions {
+  count: number
+  voiceName: string
+  useMultiVoice?: boolean  // true = 2 voice elements, false = 1 voice element
+  backgroundAudioUrl?: string  // optional background audio URL (with SAS token)
+}
+
 const TEST_SENTENCES_PRIMARY = [
   "The aurora borealis illuminated the Arctic sky with ribbons of green and purple light dancing across the horizon.",
   "Quantum entanglement challenges our understanding of locality and information transfer in the universe.",
@@ -80,23 +87,50 @@ function escapeXml(text: string): string {
     .replace(/'/g, '&apos;')
 }
 
-export function generateSsmls(count: number, voiceName: string): SsmlData[] {
+export function generateSsmls(options: SsmlGeneratorOptions | number, voiceName?: string): SsmlData[] {
+  // Support legacy call signature: generateSsmls(count, voiceName)
+  const opts: SsmlGeneratorOptions = typeof options === 'number'
+    ? { count: options, voiceName: voiceName || 'en-US-AvaNeural' }
+    : options
+
+  const {
+    count,
+    voiceName: voice,
+    useMultiVoice = true,
+    backgroundAudioUrl,
+  } = opts
+
+  // BGM defaults (hardcoded)
+  const bgmVolume = 0.3
+  const bgmFadeInMs = 2000
+  const bgmFadeOutMs = 2000
+
   const result: SsmlData[] = []
 
   for (let i = 0; i < count; i++) {
     const primaryText = TEST_SENTENCES_PRIMARY[i % TEST_SENTENCES_PRIMARY.length]
     const secondaryText = TEST_SENTENCES_SECONDARY[i % TEST_SENTENCES_SECONDARY.length]
 
+    // Build background audio element if URL provided
+    const bgmElement = backgroundAudioUrl
+      ? `<mstts:backgroundaudio src="${escapeXml(backgroundAudioUrl)}" volume="${bgmVolume}" fadein="${bgmFadeInMs}" fadeout="${bgmFadeOutMs}"/>`
+      : ''
+
+    // Build voice elements based on useMultiVoice setting
+    const voiceContent = useMultiVoice
+      ? `<voice name="${voice}">${escapeXml(primaryText)}</voice>
+    <voice name="${voice}">${escapeXml(secondaryText)}</voice>`
+      : `<voice name="${voice}">${escapeXml(primaryText)}</voice>`
+
     const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
-    <voice name="${voiceName}">${escapeXml(primaryText)}</voice>
-    <voice name="${voiceName}">${escapeXml(secondaryText)}</voice>
+    ${bgmElement}${bgmElement ? '\n    ' : ''}${voiceContent}
 </speak>`
 
     result.push({
       index: i + 1,
       ssml,
       primaryText,
-      secondaryText,
+      secondaryText: useMultiVoice ? secondaryText : '',
     })
   }
 
