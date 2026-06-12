@@ -1,7 +1,6 @@
-import { REGIONS, VOICES, OUTPUT_FORMATS } from '../constants'
-import { TestMode, DetectAuthType } from '../utils/storage'
-import { useState, useEffect, useCallback } from 'react'
-import { generateBlobSasUrlWithToken } from '../utils/blobToken'
+import { REGIONS, VOICES, OUTPUT_FORMATS, PRESET_ENDPOINTS } from '../constants'
+import { TestMode, DetectAuthType, TestOrder } from '../utils/storage'
+import { useState, useCallback, useMemo } from 'react'
 
 interface ConfigPanelProps {
   endpointType: 'region' | 'custom'
@@ -10,6 +9,16 @@ interface ConfigPanelProps {
   setRegion: (v: string) => void
   customEndpoint: string
   setCustomEndpoint: (v: string) => void
+  useDualEndpoints: boolean
+  setUseDualEndpoints: (v: boolean) => void
+  baseEndpoint: string
+  setBaseEndpoint: (v: string) => void
+  targetEndpoint: string
+  setTargetEndpoint: (v: string) => void
+  targetProvenanceEnabled: boolean | null
+  setTargetProvenanceEnabled: (v: boolean | null) => void
+  targetFlightEnabled: boolean
+  setTargetFlightEnabled: (v: boolean) => void
   subscriptionKey: string
   setSubscriptionKey: (v: string) => void
   accessToken: string
@@ -34,8 +43,14 @@ interface ConfigPanelProps {
   setDetectToken: (v: string) => void
   verifyWatermark: boolean
   setVerifyWatermark: (v: boolean) => void
+  detectMaxCount: number
+  setDetectMaxCount: (v: number) => void
   testMode: TestMode
   setTestMode: (v: TestMode) => void
+  testOrder: TestOrder
+  setTestOrder: (v: TestOrder) => void
+  apiDelay: number
+  setApiDelay: (v: number) => void
   useHttpApi: boolean
   setUseHttpApi: (v: boolean) => void
   // SSML options
@@ -43,6 +58,12 @@ interface ConfigPanelProps {
   setUseMultiVoice: (v: boolean) => void
   backgroundAudioUrl: string
   setBackgroundAudioUrl: (v: string) => void
+  inlineAudioUrl: string
+  setInlineAudioUrl: (v: string) => void
+  bgmSasToken: string
+  setBgmSasToken: (v: string) => void
+  inlineAudioSasToken: string
+  setInlineAudioSasToken: (v: string) => void
   // Callbacks
   onGenerateSsmls: () => void
   onStartTest: () => void
@@ -57,6 +78,11 @@ export function ConfigPanel({
   endpointType, setEndpointType,
   region, setRegion,
   customEndpoint, setCustomEndpoint,
+  useDualEndpoints, setUseDualEndpoints,
+  baseEndpoint, setBaseEndpoint,
+  targetEndpoint, setTargetEndpoint,
+  targetProvenanceEnabled, setTargetProvenanceEnabled,
+  targetFlightEnabled, setTargetFlightEnabled,
   subscriptionKey, setSubscriptionKey,
   accessToken, setAccessToken,
   voiceName, setVoiceName,
@@ -69,51 +95,92 @@ export function ConfigPanel({
   detectAuthType, setDetectAuthType,
   detectToken, setDetectToken,
   verifyWatermark, setVerifyWatermark,
+  detectMaxCount, setDetectMaxCount,
   testMode, setTestMode,
+  testOrder, setTestOrder,
+  apiDelay, setApiDelay,
   useHttpApi, setUseHttpApi,
   useMultiVoice, setUseMultiVoice,
   backgroundAudioUrl, setBackgroundAudioUrl,
+  inlineAudioUrl, setInlineAudioUrl,
+  bgmSasToken, setBgmSasToken,
+  inlineAudioSasToken, setInlineAudioSasToken,
   onGenerateSsmls, onStartTest, onStopTest, onClearCache, onLog,
   isRunning, hasSsmls,
 }: ConfigPanelProps) {
   // Generate SAS URL state
-  const [isGeneratingSas, setIsGeneratingSas] = useState(false)
-  const [copiedCommand, setCopiedCommand] = useState(false)
+  const [copiedBgmCommand, setCopiedBgmCommand] = useState(false)
+  const [copiedInlineCommand, setCopiedInlineCommand] = useState(false)
+  const [copiedBgmUrl, setCopiedBgmUrl] = useState(false)
+  const [copiedInlineUrl, setCopiedInlineUrl] = useState(false)
 
   // Check if URL needs SAS
   const needsSas = backgroundAudioUrl && 
     !backgroundAudioUrl.includes('?') && 
     backgroundAudioUrl.includes('.blob.core.windows.net')
 
-  // CLI command for getting storage token
-  const cliCommand = 'az account get-access-token --resource https://storage.azure.com --query accessToken -o tsv'
+  // Check if inline audio URL needs SAS
+  const needsInlineAudioSas = inlineAudioUrl && 
+    !inlineAudioUrl.includes('?') && 
+    inlineAudioUrl.includes('.blob.core.windows.net')
 
-  const handleCopyCommand = useCallback(() => {
-    navigator.clipboard.writeText(cliCommand)
-    setCopiedCommand(true)
-    setTimeout(() => setCopiedCommand(false), 2000)
+  // Parse blob URL to generate CLI command
+  const parseBlobUrl = useCallback((url: string) => {
+    try {
+      const urlObj = new URL(url)
+      const host = urlObj.hostname // e.g., "videotranslationpipeline.blob.core.windows.net"
+      const accountName = host.split('.')[0]
+      const pathParts = urlObj.pathname.split('/').filter(Boolean) // e.g., ["users", "poleli", "bgm", "button-2.wav"]
+      const containerName = pathParts[0]
+      const blobName = pathParts.slice(1).join('/')
+      return { accountName, containerName, blobName }
+    } catch {
+      return null
+    }
   }, [])
 
-  // Auto-generate SAS when accessToken is available and blob URL needs SAS
-  useEffect(() => {
-    const autoGenerateSas = async () => {
-      if (!needsSas || !accessToken || isGeneratingSas) return
-      
-      try {
-        setIsGeneratingSas(true)
-        onLog?.('🔑 Auto-generating SAS URL...', 'info')
-        const sasUrl = await generateBlobSasUrlWithToken(backgroundAudioUrl, accessToken)
-        setBackgroundAudioUrl(sasUrl)
-        onLog?.('✅ SAS URL generated successfully!', 'success')
-      } catch (error: any) {
-        onLog?.(`❌ Failed to generate SAS: ${error.message}`, 'error')
-      } finally {
-        setIsGeneratingSas(false)
-      }
-    }
+  // Generate CLI command for SAS
+  const generateSasCommand = useCallback((url: string) => {
+    const parsed = parseBlobUrl(url)
+    if (!parsed) return null
+    const expiry = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().split('T')[0] // Tomorrow
+    return `az storage blob generate-sas --account-name ${parsed.accountName} --container-name ${parsed.containerName} --name "${parsed.blobName}" --permissions r --expiry ${expiry} --auth-mode login --as-user -o tsv`
+  }, [parseBlobUrl])
 
-    autoGenerateSas()
-  }, [needsSas, accessToken]) // eslint-disable-line react-hooks/exhaustive-deps
+  // Memoized CLI commands
+  const bgmSasCommand = useMemo(() => needsSas ? generateSasCommand(backgroundAudioUrl) : null, [needsSas, backgroundAudioUrl, generateSasCommand])
+  const inlineSasCommand = useMemo(() => needsInlineAudioSas ? generateSasCommand(inlineAudioUrl) : null, [needsInlineAudioSas, inlineAudioUrl, generateSasCommand])
+
+  // Copy handlers
+  const handleCopyBgmCommand = useCallback(() => {
+    if (bgmSasCommand) {
+      navigator.clipboard.writeText(bgmSasCommand)
+      setCopiedBgmCommand(true)
+      setTimeout(() => setCopiedBgmCommand(false), 2000)
+    }
+  }, [bgmSasCommand])
+
+  const handleCopyInlineCommand = useCallback(() => {
+    if (inlineSasCommand) {
+      navigator.clipboard.writeText(inlineSasCommand)
+      setCopiedInlineCommand(true)
+      setTimeout(() => setCopiedInlineCommand(false), 2000)
+    }
+  }, [inlineSasCommand])
+
+  // Copy BGM URL
+  const handleCopyBgmUrl = useCallback(() => {
+    navigator.clipboard.writeText(backgroundAudioUrl)
+    setCopiedBgmUrl(true)
+    setTimeout(() => setCopiedBgmUrl(false), 2000)
+  }, [backgroundAudioUrl])
+
+  // Copy Inline Audio URL
+  const handleCopyInlineUrl = useCallback(() => {
+    navigator.clipboard.writeText(inlineAudioUrl)
+    setCopiedInlineUrl(true)
+    setTimeout(() => setCopiedInlineUrl(false), 2000)
+  }, [inlineAudioUrl])
 
   return (
     <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
@@ -148,15 +215,129 @@ export function ConfigPanel({
           </div>
         ) : (
           <div className="md:col-span-2">
-            <label className="block font-semibold mb-1">Custom WebSocket Endpoint:</label>
-            <input
-              type="text"
-              value={customEndpoint}
-              onChange={e => setCustomEndpoint(e.target.value)}
-              placeholder="ws://localhost:12345/cognitiveservices/websocket/v1"
-              className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            />
-            <small className="text-gray-500 text-sm">e.g., ws://localhost:12345/cognitiveservices/websocket/v1</small>
+            {/* Toggle for dual endpoints */}
+            <div className="flex items-center gap-2 mb-2">
+              <label className="block font-semibold">Custom Endpoint:</label>
+              <label className="flex items-center gap-1 text-sm cursor-pointer ml-4">
+                <input
+                  type="checkbox"
+                  checked={useDualEndpoints}
+                  onChange={e => setUseDualEndpoints(e.target.checked)}
+                  className="w-3 h-3 text-blue-600 rounded focus:ring-blue-500"
+                />
+                <span className="text-blue-600">Use different URLs for Base/Target</span>
+              </label>
+            </div>
+            
+            {!useDualEndpoints ? (
+              // Single endpoint mode
+              <>
+                <div className="flex gap-2">
+                  <select
+                    value={PRESET_ENDPOINTS.some(p => p.value === customEndpoint) ? customEndpoint : ''}
+                    onChange={e => e.target.value && setCustomEndpoint(e.target.value)}
+                    className="p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
+                  >
+                    <option value="">-- Select preset --</option>
+                    {PRESET_ENDPOINTS.map(ep => (
+                      <option key={ep.value} value={ep.value}>{ep.label}</option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    value={customEndpoint}
+                    onChange={e => setCustomEndpoint(e.target.value)}
+                    placeholder="ws://localhost:12345/cognitiveservices/websocket/v1"
+                    className="flex-1 p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                  />
+                </div>
+                <small className="text-gray-500 text-sm">Select from preset or enter custom URL</small>
+              </>
+            ) : (
+              // Dual endpoint mode
+              <div className="space-y-3 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    🏠 Base/Master FE Endpoint:
+                  </label>
+                  <div className="flex gap-2">
+                    <select
+                      value={PRESET_ENDPOINTS.some(p => p.value === baseEndpoint) ? baseEndpoint : ''}
+                      onChange={e => e.target.value && setBaseEndpoint(e.target.value)}
+                      className="p-2 border border-gray-300 rounded-md focus:border-gray-500 focus:ring-1 focus:ring-gray-500 text-sm bg-white"
+                    >
+                      <option value="">-- Select preset --</option>
+                      {PRESET_ENDPOINTS.map(ep => (
+                        <option key={ep.value} value={ep.value}>{ep.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={baseEndpoint}
+                      onChange={e => setBaseEndpoint(e.target.value)}
+                      placeholder="ws://localhost:12345/cognitiveservices/websocket/v1"
+                      className="flex-1 p-2 border border-gray-300 rounded-md focus:border-gray-500 focus:ring-1 focus:ring-gray-500 text-sm"
+                    />
+                  </div>
+                  <small className="text-gray-500 text-xs">Baseline endpoint (no provenance header, server default)</small>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-blue-700 mb-1">
+                    🎯 Target FE Endpoint:
+                  </label>
+                  <div className="flex gap-2">
+                    <select
+                      value={PRESET_ENDPOINTS.some(p => p.value === targetEndpoint) ? targetEndpoint : ''}
+                      onChange={e => e.target.value && setTargetEndpoint(e.target.value)}
+                      className="p-2 border border-blue-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm bg-white"
+                    >
+                      <option value="">-- Select preset --</option>
+                      {PRESET_ENDPOINTS.map(ep => (
+                        <option key={ep.value} value={ep.value}>{ep.label}</option>
+                      ))}
+                    </select>
+                    <input
+                      type="text"
+                      value={targetEndpoint}
+                      onChange={e => setTargetEndpoint(e.target.value)}
+                      placeholder="ws://localhost:12346/cognitiveservices/websocket/v1"
+                      className="flex-1 p-2 border border-blue-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm"
+                    />
+                  </div>
+                  <div className="flex items-center gap-4 mt-1">
+                    <label className="flex items-center gap-1 text-sm">
+                      <span className="text-gray-600">Provenance:</span>
+                      <select
+                        value={targetProvenanceEnabled === null ? 'default' : targetProvenanceEnabled ? 'true' : 'false'}
+                        onChange={e => {
+                          const v = e.target.value
+                          setTargetProvenanceEnabled(v === 'default' ? null : v === 'true')
+                        }}
+                        className="p-1 border border-blue-300 rounded text-sm bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                      >
+                        <option value="default">🔘 Default (server)</option>
+                        <option value="true">🔒 ON</option>
+                        <option value="false">🔓 OFF</option>
+                      </select>
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer text-sm">
+                      <input
+                        type="checkbox"
+                        checked={targetFlightEnabled}
+                        onChange={e => setTargetFlightEnabled(e.target.checked)}
+                        className="w-3 h-3 text-purple-600 rounded focus:ring-purple-500"
+                      />
+                      <span className={targetFlightEnabled ? 'text-purple-600' : 'text-gray-500'}>
+                        {targetFlightEnabled ? '✈️ Flight ON' : '✈️ Flight OFF'}
+                      </span>
+                    </label>
+                  </div>
+                </div>
+                <small className="text-gray-500 text-xs">
+                  Compare performance between Base (master) and Target endpoints.
+                </small>
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -305,11 +486,28 @@ export function ConfigPanel({
                   </small>
                 </div>
               )}
+              
+              {/* Max detect count */}
+              <div>
+                <label className="block font-semibold mb-1 text-sm text-purple-700">Max Detect Count:</label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    value={detectMaxCount}
+                    onChange={e => setDetectMaxCount(parseInt(e.target.value) || 0)}
+                    className="w-24 p-2 border border-gray-300 rounded-md focus:border-purple-500 focus:ring-1 focus:ring-purple-500"
+                  />
+                  <span className="text-sm text-gray-600">(0 = all)</span>
+                </div>
+                <small className="text-gray-500 text-xs">Limit number of audio files to verify. Default: 3 (detect is slow)</small>
+              </div>
             </div>
           )}
           
           <p className="text-sm text-purple-600 mt-2 ml-6">
-            When enabled, all provenance-enabled audio will be verified against the detect API after synthesis completes.
+            When enabled, provenance-enabled audio will be verified against the detect API after synthesis completes.
           </p>
         </div>
       )}
@@ -329,6 +527,7 @@ export function ConfigPanel({
           </select>
         </div>
 
+        {/* Output Format */}
         <div>
           <label className="block font-semibold mb-1">Output Format:</label>
           <select
@@ -358,6 +557,7 @@ export function ConfigPanel({
           <small className="text-gray-500 text-sm">Number of different SSML scripts to generate</small>
         </div>
 
+        {/* Iterations */}
         <div>
           <label className="block font-semibold mb-1">Iterations per SSML:</label>
           <input
@@ -371,6 +571,7 @@ export function ConfigPanel({
           <small className="text-gray-500 text-sm">Run each SSML multiple times for statistical significance</small>
         </div>
 
+        {/* Warmup */}
         <div>
           <label className="block font-semibold mb-1">Warmup Runs:</label>
           <input
@@ -419,30 +620,116 @@ export function ConfigPanel({
             <datalist id="bgm-url-options">
               <option value="https://videotranslationpipeline.blob.core.windows.net/users/poleli/bgm/background.mp3" label="Default BGM" />
             </datalist>
-            {isGeneratingSas && (
-              <span className="text-blue-500 text-sm whitespace-nowrap">⏳ Generating SAS...</span>
+            {backgroundAudioUrl && (
+              <button
+                onClick={handleCopyBgmUrl}
+                className="px-3 py-2 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 whitespace-nowrap"
+              >
+                {copiedBgmUrl ? '✅ Copied!' : '📋 Copy URL'}
+              </button>
             )}
           </div>
-          {needsSas && !accessToken && (
-            <div className="mt-2 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
-              <div className="text-yellow-700 text-sm mb-2">
-                ⚠️ Storage Access Token required. Run this command and paste to "Access Token" field above:
+          {needsSas && (
+            <>
+              <div className="mt-2">
+                <label className="block text-sm text-gray-600 mb-1">
+                  SAS Token <span className="text-gray-400">(paste here, will be auto-appended)</span>:
+                </label>
+                <input
+                  type="text"
+                  value={bgmSasToken}
+                  onChange={e => setBgmSasToken(e.target.value)}
+                  placeholder="se=2026-06-12&sp=r&sig=..."
+                  className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm font-mono"
+                />
               </div>
-              <div className="flex gap-2">
-                <code className="flex-1 p-2 bg-gray-800 text-green-400 text-xs rounded font-mono overflow-x-auto">
-                  {cliCommand}
-                </code>
-                <button
-                  onClick={handleCopyCommand}
-                  className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 whitespace-nowrap"
-                >
-                  {copiedCommand ? '✅ Copied!' : '📋 Copy'}
-                </button>
-              </div>
-            </div>
+              {bgmSasCommand && !bgmSasToken && (
+                <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                  <div className="text-blue-700 text-sm mb-2">
+                    🔑 Run this command to generate SAS token:
+                  </div>
+                  <div className="flex gap-2">
+                    <code className="flex-1 p-2 bg-gray-800 text-green-400 text-xs rounded font-mono overflow-x-auto whitespace-nowrap">
+                      {bgmSasCommand}
+                    </code>
+                    <button
+                      onClick={handleCopyBgmCommand}
+                      className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 whitespace-nowrap"
+                    >
+                      {copiedBgmCommand ? '✅ Copied!' : '📋 Copy'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
           )}
           <small className="text-gray-500 text-xs">
             Only 16kHz/24kHz sample rates support BGM. Select from dropdown or enter a URL with SAS token.
+          </small>
+        </div>
+
+        {/* Inline Audio URL (audio tag - plays sequentially) */}
+        <div className="mb-2">
+          <label className="block font-semibold mb-1 text-sm">
+            Inline Audio URL <span className="text-gray-400 font-normal">(optional, &lt;audio&gt; tag)</span>:
+          </label>
+          <div className="flex gap-2 items-center">
+            <input
+              type="text"
+              list="inline-audio-url-options"
+              value={inlineAudioUrl}
+              onChange={e => setInlineAudioUrl(e.target.value)}
+              placeholder="Select from list or enter URL"
+              className="flex-1 p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm"
+            />
+            <datalist id="inline-audio-url-options">
+              <option value="https://videotranslationpipeline.blob.core.windows.net/users/poleli/bgm/audio-tag-sample.wav" label="Quiet Audio Tag Sample" />
+            </datalist>
+            {inlineAudioUrl && (
+              <button
+                onClick={handleCopyInlineUrl}
+                className="px-3 py-2 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 whitespace-nowrap"
+              >
+                {copiedInlineUrl ? '✅ Copied!' : '📋 Copy URL'}
+              </button>
+            )}
+          </div>
+          {needsInlineAudioSas && (
+            <>
+              <div className="mt-2">
+                <label className="block text-sm text-gray-600 mb-1">
+                  SAS Token <span className="text-gray-400">(paste here, will be auto-appended)</span>:
+                </label>
+                <input
+                  type="text"
+                  value={inlineAudioSasToken}
+                  onChange={e => setInlineAudioSasToken(e.target.value)}
+                  placeholder="se=2026-06-12&sp=r&sig=..."
+                  className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm font-mono"
+                />
+              </div>
+              {inlineSasCommand && !inlineAudioSasToken && (
+                <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                  <div className="text-blue-700 text-sm mb-2">
+                    🔑 Run this command to generate SAS token:
+                  </div>
+                  <div className="flex gap-2">
+                    <code className="flex-1 p-2 bg-gray-800 text-green-400 text-xs rounded font-mono overflow-x-auto whitespace-nowrap">
+                      {inlineSasCommand}
+                    </code>
+                    <button
+                      onClick={handleCopyInlineCommand}
+                      className="px-3 py-1 bg-gray-600 text-white text-xs rounded hover:bg-gray-700 whitespace-nowrap"
+                    >
+                      {copiedInlineCommand ? '✅ Copied!' : '📋 Copy'}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+          <small className="text-gray-500 text-xs">
+            Plays sequentially before speech (not in background). Supports .mp3, .wav, .opus, .ogg, .flac, .wma.
           </small>
         </div>
       </div>
@@ -450,69 +737,116 @@ export function ConfigPanel({
       {/* Row 4.5: Test Mode */}
       <div className="mb-4">
         <label className="block font-semibold mb-1">Test Mode:</label>
-        <div className="flex flex-wrap gap-4">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="radio"
-              name="testMode"
-              value="default"
-              checked={testMode === 'default'}
-              onChange={() => setTestMode('default')}
-              className="w-4 h-4 text-blue-600"
-            />
-            <span className="text-gray-600">Default (no header, server decides)</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="radio"
-              name="testMode"
-              value="both"
-              checked={testMode === 'both'}
-              onChange={() => setTestMode('both')}
-              className="w-4 h-4 text-blue-600"
-            />
-            <span>Compare OFF vs ON</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="radio"
-              name="testMode"
-              value="provOff"
-              checked={testMode === 'provOff'}
-              onChange={() => setTestMode('provOff')}
-              className="w-4 h-4 text-blue-600"
-            />
-            <span className="text-orange-600">🔓 X-Provenance: false</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="radio"
-              name="testMode"
-              value="provOn"
-              checked={testMode === 'provOn'}
-              onChange={() => setTestMode('provOn')}
-              className="w-4 h-4 text-blue-600"
-            />
-            <span className="text-green-700 font-medium">🔒 X-Provenance: true</span>
-          </label>
-        </div>
-      </div>
+            <div className="flex flex-wrap gap-4">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="testMode"
+                  value="default"
+                  checked={testMode === 'default'}
+                  onChange={() => setTestMode('default')}
+                  className="w-4 h-4 text-blue-600"
+                />
+                <span className="text-gray-600">Default (no header, server decides)</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="testMode"
+                  value="compare"
+                  checked={testMode === 'compare'}
+                  onChange={() => setTestMode('compare')}
+                  className="w-4 h-4 text-blue-600"
+                />
+                <span>🔄 Compare Base vs Target</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="testMode"
+                  value="base"
+                  checked={testMode === 'base'}
+                  onChange={() => setTestMode('base')}
+                  className="w-4 h-4 text-blue-600"
+                />
+                <span className="text-gray-700">🏠 Base Only</span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="radio"
+                  name="testMode"
+                  value="target"
+                  checked={testMode === 'target'}
+                  onChange={() => setTestMode('target')}
+                  className="w-4 h-4 text-blue-600"
+                />
+                <span className="text-blue-700 font-medium">🎯 Target Only</span>
+              </label>
+            </div>
+            {/* Test Order - only shown when testMode is 'compare' */}
+            {testMode === 'compare' && (
+              <div className="flex items-center gap-4 mt-2 ml-4 text-sm">
+                <span className="text-gray-600">执行顺序:</span>
+                <label className="flex items-center gap-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="testOrder"
+                    value="baseFirst"
+                    checked={testOrder === 'baseFirst'}
+                    onChange={() => setTestOrder('baseFirst')}
+                    className="w-3 h-3 text-blue-600"
+                  />
+                  <span className="text-gray-700">Base</span>
+                  <span className="text-gray-400">→</span>
+                  <span className="text-blue-700">Target</span>
+                </label>
+                <label className="flex items-center gap-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="testOrder"
+                    value="targetFirst"
+                    checked={testOrder === 'targetFirst'}
+                    onChange={() => setTestOrder('targetFirst')}
+                    className="w-3 h-3 text-blue-600"
+                  />
+                  <span className="text-blue-700">Target</span>
+                  <span className="text-gray-400">→</span>
+                  <span className="text-gray-700">Base</span>
+                </label>
+              </div>
+            )}
+          </div>
 
-      {/* Row 4.6: Use HTTP API */}
-      <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
-        <label className="flex items-center gap-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={useHttpApi}
-            onChange={e => setUseHttpApi(e.target.checked)}
-            className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-          />
-          <span className="font-medium">Use HTTP REST API instead of WebSocket SDK</span>
-        </label>
-        <p className="text-sm text-gray-600 mt-1 ml-6">
-          WebSocket SDK uses <code className="bg-gray-200 px-1 rounded">provenance</code> URL query parameter.
-          HTTP REST API uses <code className="bg-gray-200 px-1 rounded">X-Microsoft-Provenance-Enabled</code> header.
-        </p>
+          {/* Row 4.7: Use HTTP API */}
+          <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useHttpApi}
+                onChange={e => setUseHttpApi(e.target.checked)}
+                className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+              />
+              <span className="font-medium">Use HTTP REST API instead of WebSocket SDK</span>
+            </label>
+            <p className="text-sm text-gray-600 mt-1 ml-6">
+              WebSocket SDK uses <code className="bg-gray-200 px-1 rounded">provenance</code> URL query parameter.
+              HTTP REST API uses <code className="bg-gray-200 px-1 rounded">X-Microsoft-Provenance-Enabled</code> header.
+            </p>
+          </div>
+
+      {/* API Delay */}
+      <div className="mb-4 flex items-center gap-3">
+        <label className="font-semibold whitespace-nowrap">API 调用间隔:</label>
+        <input
+          type="number"
+          min={0}
+          max={10000}
+          step={50}
+          value={apiDelay}
+          onChange={e => setApiDelay(Math.max(0, parseInt(e.target.value) || 0))}
+          className="w-24 px-2 py-1 border rounded focus:ring-2 focus:ring-blue-500"
+        />
+        <span className="text-gray-600 text-sm">ms (0 = 无延迟)</span>
       </div>
 
       {/* Row 5: Cache Settings */}

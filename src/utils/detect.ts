@@ -387,58 +387,219 @@ export async function getCurrentUser(): Promise<{ name: string; email: string } 
 }
 
 /**
+ * Check if the output format is raw PCM (no WAV header)
+ */
+export function isRawFormat(outputFormat: string): boolean {
+  return outputFormat.toLowerCase().startsWith('raw-')
+}
+
+/**
+ * Extract audio parameters from output format string.
+ * Examples: 'raw-24khz-16bit-mono-pcm' -> { sampleRate: 24000, bitsPerSample: 16, channels: 1 }
+ */
+export function parseAudioFormat(outputFormat: string): { sampleRate: number; bitsPerSample: number; channels: number } {
+  const format = outputFormat.toLowerCase()
+  
+  // Extract sample rate (e.g., '24khz' -> 24000)
+  const sampleRateMatch = format.match(/(\d+)khz/)
+  const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1]) * 1000 : 24000
+  
+  // Extract bits per sample (e.g., '16bit' -> 16)
+  const bitsMatch = format.match(/(\d+)bit/)
+  const bitsPerSample = bitsMatch ? parseInt(bitsMatch[1]) : 16
+  
+  // Extract channels (mono = 1, stereo = 2)
+  const channels = format.includes('stereo') ? 2 : 1
+  
+  return { sampleRate, bitsPerSample, channels }
+}
+
+/**
+ * Add WAV header to raw PCM data.
+ * This creates a valid WAV file from raw PCM audio data.
+ */
+export function addWavHeader(rawPcmData: ArrayBuffer, sampleRate: number, bitsPerSample: number = 16, channels: number = 1): ArrayBuffer {
+  const dataSize = rawPcmData.byteLength
+  const byteRate = sampleRate * channels * (bitsPerSample / 8)
+  const blockAlign = channels * (bitsPerSample / 8)
+  
+  // WAV header is 44 bytes
+  const headerSize = 44
+  const wavBuffer = new ArrayBuffer(headerSize + dataSize)
+  const view = new DataView(wavBuffer)
+  
+  // RIFF header
+  writeString(view, 0, 'RIFF')                      // ChunkID
+  view.setUint32(4, 36 + dataSize, true)            // ChunkSize (file size - 8)
+  writeString(view, 8, 'WAVE')                      // Format
+  
+  // fmt sub-chunk
+  writeString(view, 12, 'fmt ')                     // Subchunk1ID
+  view.setUint32(16, 16, true)                      // Subchunk1Size (16 for PCM)
+  view.setUint16(20, 1, true)                       // AudioFormat (1 = PCM)
+  view.setUint16(22, channels, true)                // NumChannels
+  view.setUint32(24, sampleRate, true)              // SampleRate
+  view.setUint32(28, byteRate, true)                // ByteRate
+  view.setUint16(32, blockAlign, true)              // BlockAlign
+  view.setUint16(34, bitsPerSample, true)           // BitsPerSample
+  
+  // data sub-chunk
+  writeString(view, 36, 'data')                     // Subchunk2ID
+  view.setUint32(40, dataSize, true)                // Subchunk2Size
+  
+  // Copy PCM data after header
+  new Uint8Array(wavBuffer, headerSize).set(new Uint8Array(rawPcmData))
+  
+  return wavBuffer
+}
+
+/**
+ * Helper to write ASCII string to DataView
+ */
+function writeString(view: DataView, offset: number, str: string): void {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i))
+  }
+}
+
+/**
+ * Parse Retry-After header value
+ * Can be either seconds (number) or HTTP-date
+ */
+function parseRetryAfter(retryAfter: string | null): number {
+  if (!retryAfter) return 1000 // Default 1 second
+  
+  // Try parsing as seconds
+  const seconds = parseInt(retryAfter, 10)
+  if (!isNaN(seconds)) {
+    return seconds * 1000
+  }
+  
+  // Try parsing as HTTP-date
+  const date = Date.parse(retryAfter)
+  if (!isNaN(date)) {
+    const delayMs = date - Date.now()
+    return Math.max(delayMs, 0)
+  }
+  
+  return 1000 // Default 1 second
+}
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/**
+ * Parse retry after duration from error message like:
+ * "Please retry after 7 seconds."
+ * Returns milliseconds
+ */
+function parseRetryAfterFromMessage(message: string): number {
+  const match = message.match(/retry after (\d+) seconds?/i)
+  if (match) {
+    return parseInt(match[1], 10) * 1000
+  }
+  return 1000 // Default 1 second
+}
+
+/**
  * Call the Provenance Detect API using API Key authentication
  * @param detectUrl The Content Safety detect endpoint URL
  * @param apiKey The Content Safety API key
  * @param audioData The audio data as ArrayBuffer
  * @param mimeType The MIME type of the audio (e.g., 'audio/wav', 'audio/mpeg')
+ * @param maxRetries Maximum number of retries for 429 errors (default: 5)
  */
 export async function detectWatermarkWithKey(
   detectUrl: string,
   apiKey: string,
   audioData: ArrayBuffer,
-  mimeType: string = 'audio/wav'
+  mimeType: string = 'audio/wav',
+  maxRetries: number = 5
 ): Promise<DetectResult> {
-  try {
-    // Convert audio data to base64
-    const base64Data = arrayBufferToBase64(audioData)
-    
-    // Build the detect request
-    const requestBody = {
-      mimeType: mimeType,
-      data: base64Data,
-    }
-    
-    // Call the detect API (remove trailing slash from URL if present)
-    const baseUrl = detectUrl.replace(/\/+$/, '')
-    const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Ocp-Apim-Subscription-Key': apiKey,
-      },
-      body: JSON.stringify(requestBody),
-    })
-    
-    if (!response.ok) {
-      const errorText = await response.text()
-      return {
-        status: 'Error',
-        error: `HTTP ${response.status}: ${errorText}`,
+  // Convert audio data to base64
+  const base64Data = arrayBufferToBase64(audioData)
+  
+  // Build the detect request
+  const requestBody = {
+    mimeType: mimeType,
+    data: base64Data,
+  }
+  
+  // Call the detect API (remove trailing slash from URL if present)
+  const baseUrl = detectUrl.replace(/\/+$/, '')
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Ocp-Apim-Subscription-Key': apiKey,
+        },
+        body: JSON.stringify(requestBody),
+      })
+      
+      // Handle 429 Too Many Requests with Retry-After header
+      if (response.status === 429 && attempt < maxRetries) {
+        const retryAfter = response.headers.get('Retry-After')
+        const delayMs = parseRetryAfter(retryAfter)
+        console.log(`Rate limited (429), waiting ${delayMs}ms before retry ${attempt + 1}/${maxRetries}`)
+        await sleep(delayMs)
+        continue
       }
+      
+      // Parse response body
+      const responseText = await response.text()
+      let result: any
+      try {
+        result = JSON.parse(responseText)
+      } catch {
+        return {
+          status: 'Error',
+          error: `HTTP ${response.status}: ${responseText}`,
+        }
+      }
+      
+      // Handle 429 in response body (Content Safety API returns this format)
+      // { "error": { "code": "429", "message": "... Please retry after 7 seconds. ..." } }
+      if (result.error?.code === '429' && attempt < maxRetries) {
+        const delayMs = parseRetryAfterFromMessage(result.error.message || '')
+        console.log(`Rate limited (body 429), waiting ${delayMs}ms before retry ${attempt + 1}/${maxRetries}`)
+        await sleep(delayMs)
+        continue
+      }
+      
+      if (!response.ok || result.error) {
+        return {
+          status: 'Error',
+          error: result.error ? `${result.error.code}: ${result.error.message}` : `HTTP ${response.status}: ${responseText}`,
+        }
+      }
+      
+      return {
+        status: result.status || 'Unknown',
+        publicUUID: result.publicUUID,
+        raw: result,
+      }
+    } catch (error: any) {
+      if (attempt === maxRetries) {
+        return {
+          status: 'Error',
+          error: error.message || 'Unknown error',
+        }
+      }
+      // For network errors, wait a bit before retry
+      await sleep(1000)
     }
-    
-    const result = await response.json()
-    return {
-      status: result.status || 'Unknown',
-      publicUUID: result.publicUUID,
-      raw: result,
-    }
-  } catch (error: any) {
-    return {
-      status: 'Error',
-      error: error.message || 'Unknown error',
-    }
+  }
+  
+  return {
+    status: 'Error',
+    error: 'Max retries exceeded',
   }
 }
 
@@ -448,52 +609,94 @@ export async function detectWatermarkWithKey(
  * @param token The Bearer access token (e.g., from az account get-access-token)
  * @param audioData The audio data as ArrayBuffer
  * @param mimeType The MIME type of the audio (e.g., 'audio/wav', 'audio/mpeg')
+ * @param maxRetries Maximum number of retries for 429 errors (default: 5)
  */
 export async function detectWatermarkWithToken(
   detectUrl: string,
   token: string,
   audioData: ArrayBuffer,
-  mimeType: string = 'audio/wav'
+  mimeType: string = 'audio/wav',
+  maxRetries: number = 5
 ): Promise<DetectResult> {
-  try {
-    // Convert audio data to base64
-    const base64Data = arrayBufferToBase64(audioData)
-    
-    // Build the detect request
-    const requestBody = {
-      mimeType: mimeType,
-      data: base64Data,
-    }
-    
-    // Call the detect API (remove trailing slash from URL if present)
-    const baseUrl = detectUrl.replace(/\/+$/, '')
-    const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify(requestBody),
-    })
-    
-    if (!response.ok) {
-      const errorText = await response.text()
-      return {
-        status: 'Error',
-        error: `HTTP ${response.status}: ${errorText}`,
+  // Convert audio data to base64
+  const base64Data = arrayBufferToBase64(audioData)
+  
+  // Build the detect request
+  const requestBody = {
+    mimeType: mimeType,
+    data: base64Data,
+  }
+  
+  // Call the detect API (remove trailing slash from URL if present)
+  const baseUrl = detectUrl.replace(/\/+$/, '')
+  
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(`${baseUrl}/contentsafety/provenance:detect?api-version=2025-09-15-preview`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify(requestBody),
+      })
+      
+      // Handle 429 Too Many Requests with Retry-After header
+      if (response.status === 429 && attempt < maxRetries) {
+        const retryAfter = response.headers.get('Retry-After')
+        const delayMs = parseRetryAfter(retryAfter)
+        console.log(`Rate limited (429), waiting ${delayMs}ms before retry ${attempt + 1}/${maxRetries}`)
+        await sleep(delayMs)
+        continue
       }
+      
+      // Parse response body
+      const responseText = await response.text()
+      let result: any
+      try {
+        result = JSON.parse(responseText)
+      } catch {
+        return {
+          status: 'Error',
+          error: `HTTP ${response.status}: ${responseText}`,
+        }
+      }
+      
+      // Handle 429 in response body (Content Safety API returns this format)
+      // { "error": { "code": "429", "message": "... Please retry after 7 seconds. ..." } }
+      if (result.error?.code === '429' && attempt < maxRetries) {
+        const delayMs = parseRetryAfterFromMessage(result.error.message || '')
+        console.log(`Rate limited (body 429), waiting ${delayMs}ms before retry ${attempt + 1}/${maxRetries}`)
+        await sleep(delayMs)
+        continue
+      }
+      
+      if (!response.ok || result.error) {
+        return {
+          status: 'Error',
+          error: result.error ? `${result.error.code}: ${result.error.message}` : `HTTP ${response.status}: ${responseText}`,
+        }
+      }
+      
+      return {
+        status: result.status || 'Unknown',
+        publicUUID: result.publicUUID,
+        raw: result,
+      }
+    } catch (error: any) {
+      if (attempt === maxRetries) {
+        return {
+          status: 'Error',
+          error: error.message || 'Unknown error',
+        }
+      }
+      // For network errors, wait a bit before retry
+      await sleep(1000)
     }
-    
-    const result = await response.json()
-    return {
-      status: result.status || 'Unknown',
-      publicUUID: result.publicUUID,
-      raw: result,
-    }
-  } catch (error: any) {
-    return {
-      status: 'Error',
-      error: error.message || 'Unknown error',
-    }
+  }
+  
+  return {
+    status: 'Error',
+    error: 'Max retries exceeded',
   }
 }

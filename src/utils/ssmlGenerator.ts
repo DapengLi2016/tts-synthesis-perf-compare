@@ -9,7 +9,10 @@ export interface SsmlGeneratorOptions {
   count: number
   voiceName: string
   useMultiVoice?: boolean  // true = 2 voice elements, false = 1 voice element
-  backgroundAudioUrl?: string  // optional background audio URL (with SAS token)
+  backgroundAudioUrl?: string  // optional background audio URL
+  inlineAudioUrl?: string  // optional inline audio URL for <audio> tag (plays sequentially)
+  bgmSasToken?: string  // SAS token for background audio URL
+  inlineAudioSasToken?: string  // SAS token for inline audio URL
 }
 
 const TEST_SENTENCES_PRIMARY = [
@@ -98,7 +101,24 @@ export function generateSsmls(options: SsmlGeneratorOptions | number, voiceName?
     voiceName: voice,
     useMultiVoice = true,
     backgroundAudioUrl,
+    inlineAudioUrl,
+    bgmSasToken,
+    inlineAudioSasToken,
   } = opts
+
+  // Helper to append SAS token to blob URL if needed
+  const appendSas = (url: string | undefined, sasToken: string | undefined): string | undefined => {
+    if (!url) return undefined
+    // If URL already has query params, don't append
+    if (url.includes('?')) return url
+    // If no SAS token provided, return as-is
+    if (!sasToken) return url
+    // Append SAS token
+    return `${url}?${sasToken}`
+  }
+
+  const bgmUrlWithSas = appendSas(backgroundAudioUrl, bgmSasToken)
+  const inlineUrlWithSas = appendSas(inlineAudioUrl, inlineAudioSasToken)
 
   // BGM defaults (hardcoded)
   const bgmVolume = 0.3
@@ -112,15 +132,20 @@ export function generateSsmls(options: SsmlGeneratorOptions | number, voiceName?
     const secondaryText = TEST_SENTENCES_SECONDARY[i % TEST_SENTENCES_SECONDARY.length]
 
     // Build background audio element if URL provided
-    const bgmElement = backgroundAudioUrl
-      ? `<mstts:backgroundaudio src="${escapeXml(backgroundAudioUrl)}" volume="${bgmVolume}" fadein="${bgmFadeInMs}" fadeout="${bgmFadeOutMs}"/>`
+    const bgmElement = bgmUrlWithSas
+      ? `<mstts:backgroundaudio src="${escapeXml(bgmUrlWithSas)}" volume="${bgmVolume}" fadein="${bgmFadeInMs}" fadeout="${bgmFadeOutMs}"/>`
+      : ''
+
+    // Build inline audio element if URL provided (plays sequentially before speech)
+    const inlineAudioElement = inlineUrlWithSas
+      ? `<audio src="${escapeXml(inlineUrlWithSas)}"/>`
       : ''
 
     // Build voice elements based on useMultiVoice setting
     const voiceContent = useMultiVoice
-      ? `<voice name="${voice}">${escapeXml(primaryText)}</voice>
+      ? `<voice name="${voice}">${inlineAudioElement}${escapeXml(primaryText)}</voice>
     <voice name="${voice}">${escapeXml(secondaryText)}</voice>`
-      : `<voice name="${voice}">${escapeXml(primaryText)}</voice>`
+      : `<voice name="${voice}">${inlineAudioElement}${escapeXml(primaryText)}</voice>`
 
     const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" xml:lang="en-US">
     ${bgmElement}${bgmElement ? '\n    ' : ''}${voiceContent}

@@ -1,11 +1,12 @@
 import * as SpeechSDK from 'microsoft-cognitiveservices-speech-sdk'
 import { SsmlData } from './ssmlGenerator'
-import { TestMode } from './storage'
+import { TestMode, TestOrder } from './storage'
 
 export interface TestResult {
   ssmlIndex: number
   iteration: number
-  provenanceEnabled: boolean
+  provenanceEnabled: boolean  // Whether provenance was enabled for this test
+  isTargetEndpoint: boolean  // true = target FE, false = base FE
   firstByteLatencyMs?: number
   lastByteLatencyMs?: number
   totalBytes?: number
@@ -23,9 +24,16 @@ interface RunTestOptions {
   iterations: number
   subscriptionKey: string
   endpoint: string | null
+  baseEndpoint?: string | null  // Base/Master FE endpoint (when useDualEndpoints is true)
+  targetEndpoint?: string | null  // Target FE endpoint (when useDualEndpoints is true)
+  targetProvenanceEnabled?: boolean | null  // Enable provenance on target FE: true=ON, false=OFF, null=server default
+  targetFlightEnabled?: boolean  // Enable ttsfrontend-provenance flight via setfeature query param
+  useDualEndpoints?: boolean  // Use different endpoints for Base vs Target comparison
   region: string | null
   outputFormat: string
   testMode?: TestMode
+  testOrder?: TestOrder  // Execution order when testMode='compare'
+  apiDelay?: number  // Delay in ms between API calls (default: 100)
   useHttpApi?: boolean  // Use HTTP REST API instead of WebSocket SDK
   onProgress: (current: number, total: number, label: string) => void
   onResult: (result: TestResult) => void
@@ -49,6 +57,8 @@ type ProvenanceMode = boolean | undefined
 // Request parameter/header names (matching Frontend's RequestVariants and RequestHeaders)
 const PROVENANCE_QUERY_PARAM = 'provenance'  // URL query parameter for WebSocket SDK
 const PROVENANCE_HEADER = 'X-Microsoft-Provenance-Enabled'  // HTTP header for REST API
+const SETFEATURE_QUERY_PARAM = 'setfeature'  // URL query parameter for enabling flights
+const PROVENANCE_FLIGHT_NAME = 'ttsfrontend-provenance'  // Flight name for provenance feature
 
 /**
  * Extract sample rate from output format string.
@@ -102,7 +112,7 @@ async function synthesizeWithHttpApi(
   outputFormat: string,
   provenanceMode: ProvenanceMode,
   signal?: AbortSignal
-): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp'>> {
+): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>> {
   const startTime = performance.now()
   
   const headers: Record<string, string> = {
@@ -159,7 +169,7 @@ async function synthesizeWithLatencyTracking(
   ssml: string,
   provenanceMode: ProvenanceMode,
   outputFormat: string
-): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp'>> {
+): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>> {
   return new Promise((resolve, reject) => {
     const synthesizer = new SpeechSDK.SpeechSynthesizer(speechConfig, null as any)
     const sampleRate = getSampleRateFromFormat(outputFormat)
@@ -220,30 +230,63 @@ async function synthesizeWithLatencyTracking(
 }
 
 export async function runPerformanceTest(options: RunTestOptions): Promise<TestResult[]> {
-  const { ssmls, iterations, subscriptionKey, endpoint, region, outputFormat, testMode = 'both', useHttpApi = false, onProgress, onResult, signal } = options
+  const { ssmls, iterations, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, testMode = 'compare', testOrder = 'baseFirst', apiDelay = 100, useHttpApi = false, onProgress, onResult, signal } = options
 
-  // Determine which provenance modes to test based on testMode
-  // undefined = don't set header (server default), false = set to false, true = set to true
-  const provenanceModes: ProvenanceMode[] = 
-    testMode === 'default' ? [undefined] :
-    testMode === 'provOff' ? [false] :
-    testMode === 'provOn' ? [true] :
-    [false, true]  // 'both' - compare explicit false vs explicit true
+  // Convert null to undefined for provenanceMode (null means use server default)
+  const targetProvenanceMode: ProvenanceMode = targetProvenanceEnabled ?? undefined
 
-  const totalTests = ssmls.length * iterations * provenanceModes.length
+  // Define endpoint configs based on test mode
+  // Each config: { isTarget: boolean, endpoint: string | null | undefined, provenanceMode: ProvenanceMode, flightEnabled: boolean }
+  type EndpointConfig = { isTarget: boolean; endpoint: string | null | undefined; provenanceMode: ProvenanceMode; flightEnabled: boolean }
+  
+  const endpointConfigs: EndpointConfig[] = []
+  
+  if (testMode === 'default') {
+    // Default mode: single endpoint, no provenance header
+    endpointConfigs.push({ isTarget: false, endpoint: endpoint, provenanceMode: undefined, flightEnabled: false })
+  } else if (testMode === 'base') {
+    // Base only: use base endpoint, no provenance header (server default)
+    const baseEp = useDualEndpoints ? baseEndpoint : endpoint
+    endpointConfigs.push({ isTarget: false, endpoint: baseEp, provenanceMode: undefined, flightEnabled: false })
+  } else if (testMode === 'target') {
+    // Target only: use target endpoint, provenance as configured
+    const targetEp = useDualEndpoints ? targetEndpoint : endpoint
+    endpointConfigs.push({ isTarget: true, endpoint: targetEp, provenanceMode: targetProvenanceMode, flightEnabled: targetFlightEnabled })
+  } else {
+    // Compare mode: both base and target
+    const baseEp = useDualEndpoints ? baseEndpoint : endpoint
+    const targetEp = useDualEndpoints ? targetEndpoint : endpoint
+    const baseConfig: EndpointConfig = { isTarget: false, endpoint: baseEp, provenanceMode: undefined, flightEnabled: false }
+    const targetConfig: EndpointConfig = { isTarget: true, endpoint: targetEp, provenanceMode: targetProvenanceMode, flightEnabled: targetFlightEnabled }
+    
+    if (testOrder === 'baseFirst') {
+      endpointConfigs.push(baseConfig, targetConfig)
+    } else {
+      endpointConfigs.push(targetConfig, baseConfig)
+    }
+  }
+
+  const totalTests = ssmls.length * iterations * endpointConfigs.length
   let completedTests = 0
   const results: TestResult[] = []
 
-  // Helper to get label for provenance mode
-  const getProvLabel = (mode: ProvenanceMode) => 
-    mode === undefined ? 'DEFAULT' : mode ? 'ON' : 'OFF'
+  // Helper to get label for endpoint config
+  const getConfigLabel = (config: EndpointConfig) => {
+    const epType = config.isTarget ? 'Target' : 'Base'
+    const provLabel = config.provenanceMode === undefined ? 'default' : config.provenanceMode ? 'ON' : 'OFF'
+    return `${epType}(prov=${provLabel})`
+  }
 
-  // Get HTTP endpoint if using HTTP API
-  const httpEndpoint = useHttpApi 
-    ? (endpoint ? wsToHttpEndpoint(endpoint) : getRegionHttpEndpoint(region!))
-    : null
+  // Helper to get HTTP endpoint from config
+  const getHttpEndpoint = (config: EndpointConfig): string | null => {
+    if (!useHttpApi) return null
+    if (config.endpoint) {
+      return wsToHttpEndpoint(config.endpoint)
+    }
+    return region ? getRegionHttpEndpoint(region) : null
+  }
 
-  console.log(`Running tests: useHttpApi=${useHttpApi}, endpoint=${httpEndpoint || endpoint || region}`)
+  console.log(`Running tests: useHttpApi=${useHttpApi}, useDualEndpoints=${useDualEndpoints}, testMode=${testMode}, endpoint=${endpoint || region}`)
 
   for (let iter = 0; iter < iterations; iter++) {
     for (let i = 0; i < ssmls.length; i++) {
@@ -253,17 +296,19 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
 
       const ssmlData = ssmls[i]
 
-      for (const provenanceMode of provenanceModes) {
+      for (const config of endpointConfigs) {
         if (signal.aborted) {
           throw new DOMException('Aborted', 'AbortError')
         }
 
-        const testLabel = `SSML ${ssmlData.index}/${ssmls.length}, Iter ${iter + 1}/${iterations}, Prov=${getProvLabel(provenanceMode)}${useHttpApi ? ' (HTTP)' : ''}`
+        const currentEndpoint = config.endpoint
+        const testLabel = `SSML ${ssmlData.index}/${ssmls.length}, Iter ${iter + 1}/${iterations}, ${getConfigLabel(config)}${useHttpApi ? ' (HTTP)' : ''}${useDualEndpoints ? ` [${currentEndpoint ? new URL(currentEndpoint).host : region}]` : ''}`
         onProgress(completedTests, totalTests, testLabel)
 
         try {
-          let synthesisResult: Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp'>
+          let synthesisResult: Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>
 
+          const httpEndpoint = getHttpEndpoint(config)
           if (useHttpApi && httpEndpoint) {
             // Use HTTP REST API (X-Microsoft-Provenance-Enabled header)
             synthesisResult = await synthesizeWithHttpApi(
@@ -271,7 +316,7 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
               subscriptionKey,
               ssmlData.ssml,
               outputFormat,
-              provenanceMode,
+              config.provenanceMode,
               signal
             )
           } else {
@@ -280,10 +325,13 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
             
             // Build endpoint URL with provenance parameter directly in the URL
             // because JS SDK's setServiceProperty may not add params to WebSocket URL
-            if (endpoint) {
-              const endpointUrl = new URL(endpoint)
-              if (provenanceMode !== undefined) {
-                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, provenanceMode ? 'true' : 'false')
+            if (currentEndpoint) {
+              const endpointUrl = new URL(currentEndpoint)
+              if (config.flightEnabled) {
+                endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
+              }
+              if (config.provenanceMode !== undefined) {
+                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
               }
               console.log(`WebSocket endpoint with provenance: ${endpointUrl.toString()}`)
               speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
@@ -291,8 +339,11 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
               // For region-based endpoint, we need to construct the WebSocket URL manually
               const wsEndpoint = `wss://${region}.tts.speech.microsoft.com/cognitiveservices/websocket/v1`
               const endpointUrl = new URL(wsEndpoint)
-              if (provenanceMode !== undefined) {
-                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, provenanceMode ? 'true' : 'false')
+              if (config.flightEnabled) {
+                endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
+              }
+              if (config.provenanceMode !== undefined) {
+                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
               }
               console.log(`WebSocket endpoint with provenance: ${endpointUrl.toString()}`)
               speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
@@ -300,12 +351,13 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
 
             speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-            synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, provenanceMode, outputFormat)
+            synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, config.provenanceMode, outputFormat)
           }
 
           const result: TestResult = {
             ssmlIndex: ssmlData.index,
             iteration: iter + 1,
+            isTargetEndpoint: config.isTarget,
             ...synthesisResult,
             timestamp: new Date().toISOString(),
           }
@@ -316,7 +368,8 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
           const result: TestResult = {
             ssmlIndex: ssmlData.index,
             iteration: iter + 1,
-            provenanceEnabled: provenanceMode === true,
+            provenanceEnabled: config.provenanceMode === true,
+            isTargetEndpoint: config.isTarget,
             success: false,
             error: error.message,
             timestamp: new Date().toISOString(),
@@ -328,8 +381,10 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
 
         completedTests++
 
-        // Small delay between requests
-        await new Promise(resolve => setTimeout(resolve, 100))
+        // Delay between requests (configurable)
+        if (apiDelay > 0) {
+          await new Promise(resolve => setTimeout(resolve, apiDelay))
+        }
       }
     }
   }
@@ -342,6 +397,11 @@ interface WarmupOptions {
   warmupRuns: number
   subscriptionKey: string
   endpoint: string | null
+  baseEndpoint?: string | null  // Base/Master FE endpoint (when useDualEndpoints is true)
+  targetEndpoint?: string | null  // Target FE endpoint (when useDualEndpoints is true)
+  targetProvenanceEnabled?: boolean | null  // Enable provenance on target FE: true=ON, false=OFF, null=server default
+  targetFlightEnabled?: boolean  // Enable ttsfrontend-provenance flight via setfeature query param
+  useDualEndpoints?: boolean  // Use different endpoints for Base vs Target
   region: string | null
   outputFormat: string
   onLog: (message: string) => void
@@ -349,45 +409,72 @@ interface WarmupOptions {
 }
 
 export async function runWarmup(options: WarmupOptions): Promise<void> {
-  const { ssml, warmupRuns, subscriptionKey, endpoint, region, outputFormat, onLog, signal } = options
+  const { ssml, warmupRuns, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, onLog, signal } = options
+
+  // Convert null to undefined for provenanceMode (null means use server default)
+  const targetProvenanceMode: ProvenanceMode = targetProvenanceEnabled ?? undefined
 
   if (warmupRuns <= 0) {
     return
   }
 
-  onLog(`🔥 Starting warmup (${warmupRuns} runs each for ON/OFF)...`)
+  // Define endpoint configs for warmup: { isTarget, endpoint, provenanceMode, flightEnabled }
+  type EndpointConfig = { isTarget: boolean; endpoint: string | null; provenanceMode: ProvenanceMode; flightEnabled: boolean }
+  
+  const endpointConfigs: EndpointConfig[] = []
+  if (useDualEndpoints) {
+    // Warmup both base and target endpoints
+    endpointConfigs.push({ isTarget: false, endpoint: baseEndpoint || endpoint, provenanceMode: undefined, flightEnabled: false })
+    endpointConfigs.push({ isTarget: true, endpoint: targetEndpoint || endpoint, provenanceMode: targetProvenanceMode, flightEnabled: targetFlightEnabled })
+  } else {
+    // Single endpoint: warmup with server default
+    endpointConfigs.push({ isTarget: false, endpoint: endpoint, provenanceMode: undefined, flightEnabled: false })
+  }
+
+  onLog(`🔥 Starting warmup (${warmupRuns} runs${useDualEndpoints ? ' for Base/Target' : ''})...`)
 
   for (let i = 0; i < warmupRuns; i++) {
-    for (const provenanceMode of [false, true] as ProvenanceMode[]) {
+    for (const config of endpointConfigs) {
       if (signal.aborted) {
         throw new DOMException('Aborted', 'AbortError')
       }
 
       try {
         let speechConfig: SpeechSDK.SpeechConfig
+        const currentEndpoint = config.endpoint
         
         // Build endpoint URL with provenance parameter directly
-        if (endpoint) {
-          const endpointUrl = new URL(endpoint)
-          if (provenanceMode !== undefined) {
-            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, provenanceMode ? 'true' : 'false')
+        if (currentEndpoint) {
+          const endpointUrl = new URL(currentEndpoint)
+          if (config.flightEnabled) {
+            endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
+          }
+          if (config.provenanceMode !== undefined) {
+            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
           }
           speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
         } else {
           const wsEndpoint = `wss://${region}.tts.speech.microsoft.com/cognitiveservices/websocket/v1`
           const endpointUrl = new URL(wsEndpoint)
-          if (provenanceMode !== undefined) {
-            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, provenanceMode ? 'true' : 'false')
+          if (config.flightEnabled) {
+            endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
+          }
+          if (config.provenanceMode !== undefined) {
+            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
           }
           speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
         }
 
         speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-        await synthesizeWithLatencyTracking(speechConfig, ssml, provenanceMode, outputFormat)
-        onLog(`  ✓ Warmup ${i + 1}/${warmupRuns}, Prov=${provenanceMode ? 'ON' : 'OFF'}`)
+        await synthesizeWithLatencyTracking(speechConfig, ssml, config.provenanceMode, outputFormat)
+        const label = config.isTarget ? 'Target' : 'Base'
+        const provLabel = config.provenanceMode === undefined ? 'default' : config.provenanceMode ? 'ON' : 'OFF'
+        const endpointInfo = useDualEndpoints && currentEndpoint ? ` [${new URL(currentEndpoint).host}]` : ''
+        onLog(`  ✓ Warmup ${i + 1}/${warmupRuns}, ${label}(prov=${provLabel})${endpointInfo}`)
       } catch (error: any) {
-        onLog(`  ✗ Warmup ${i + 1}/${warmupRuns}, Prov=${provenanceMode ? 'ON' : 'OFF'}: ${error.message}`)
+        const label = config.isTarget ? 'Target' : 'Base'
+        onLog(`  ✗ Warmup ${i + 1}/${warmupRuns}, ${label}: ${error.message}`)
       }
 
       await new Promise(resolve => setTimeout(resolve, 100))

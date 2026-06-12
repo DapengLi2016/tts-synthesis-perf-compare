@@ -2,7 +2,8 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import JSZip from 'jszip'
 import { TestResult } from '../utils/synthesizer'
 import { SsmlData } from '../utils/ssmlGenerator'
-import { detectWatermark, DetectResult, getCurrentUser, isSignedIn, setManualToken, clearManualToken } from '../utils/detect'
+import { detectWatermarkWithKey, detectWatermarkWithToken, DetectResult, getCurrentUser, isSignedIn, setManualToken, clearManualToken, isRawFormat, parseAudioFormat, addWavHeader } from '../utils/detect'
+import { DetectAuthType } from '../utils/storage'
 
 interface AudioListProps {
   results: TestResult[]
@@ -10,6 +11,9 @@ interface AudioListProps {
   detectUrl: string
   outputFormat: string
   autoDetectResults?: Record<string, DetectResult>
+  detectAuthType: DetectAuthType
+  detectToken: string
+  accessToken: string
 }
 
 interface AudioItemState {
@@ -18,7 +22,7 @@ interface AudioItemState {
   detectResult?: DetectResult
 }
 
-export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectResults }: AudioListProps) {
+export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectResults, detectAuthType, detectToken, accessToken }: AudioListProps) {
   const [expandedOff, setExpandedOff] = useState(false)
   const [expandedOn, setExpandedOn] = useState(false)
   const [audioStates, setAudioStates] = useState<Record<string, AudioItemState>>({})
@@ -99,11 +103,21 @@ export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectR
     if (!result.audioData) return null
     const key = `${result.ssmlIndex}-${result.iteration}-${result.provenanceEnabled}`
     if (!audioUrlsRef.current[key]) {
-      const blob = new Blob([result.audioData], { type: getMimeType() })
+      let audioData = result.audioData
+      let mimeType = getMimeType()
+      
+      // For RAW formats, add WAV header so browser can play
+      if (isRawFormat(outputFormat)) {
+        const params = parseAudioFormat(outputFormat)
+        audioData = addWavHeader(audioData, params.sampleRate, params.bitsPerSample, params.channels)
+        mimeType = 'audio/wav'
+      }
+      
+      const blob = new Blob([audioData], { type: mimeType })
       audioUrlsRef.current[key] = URL.createObjectURL(blob)
     }
     return audioUrlsRef.current[key]
-  }, [getMimeType])
+  }, [getMimeType, outputFormat])
 
   // Cleanup blob URLs on unmount
   useEffect(() => {
@@ -152,12 +166,32 @@ export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectR
   const handleDetect = useCallback(async (result: TestResult) => {
     if (!detectUrl || !result.audioData) return
     
+    // Check if we have the required credentials
+    if (detectAuthType === 'token' && !accessToken) {
+      setLoginError('Access Token is required for Bearer authentication. Please fill in the Access Token field in Config.')
+      return
+    }
+    if (detectAuthType === 'apiKey' && !detectToken) {
+      setLoginError('Detect API Key is required. Please fill in the Detect Token field in Config.')
+      return
+    }
+    
     const key = getItemKey(result)
     setAudioStates(prev => ({ ...prev, [key]: { ...prev[key], isDetecting: true } }))
     setLoginError(null)
     
     try {
-      const detectResult = await detectWatermark(detectUrl, result.audioData, getMimeType())
+      // Handle raw format by adding WAV header
+      let audioData = result.audioData
+      if (isRawFormat(outputFormat)) {
+        const params = parseAudioFormat(outputFormat)
+        audioData = addWavHeader(audioData, params.sampleRate, params.bitsPerSample, params.channels)
+      }
+      
+      // Use the appropriate detect function based on auth type
+      const detectResult = detectAuthType === 'token'
+        ? await detectWatermarkWithToken(detectUrl, accessToken, audioData, getMimeType())
+        : await detectWatermarkWithKey(detectUrl, detectToken, audioData, getMimeType())
       setAudioStates(prev => ({ 
         ...prev, 
         [key]: { ...prev[key], isDetecting: false, detectResult } 
@@ -183,7 +217,7 @@ export function AudioList({ results, ssmls, detectUrl, outputFormat, autoDetectR
         } 
       }))
     }
-  }, [detectUrl, getMimeType])
+  }, [detectUrl, detectAuthType, detectToken, accessToken, outputFormat, getMimeType])
 
   const handleAudioEnded = useCallback((key: string) => {
     setAudioStates(prev => ({ ...prev, [key]: { ...prev[key], isPlaying: false } }))
