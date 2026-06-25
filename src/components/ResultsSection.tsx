@@ -45,14 +45,16 @@ export function ResultsSection({ results, autoDetectResults = {} }: ResultsSecti
 
   let impactText: string
   let impactColor: string
-  if (Math.abs(pctChange) < 5) {
-    impactText = '✅ Minimal (<5%)'
+  // Lower latency is better: negative pctChange = improvement (green);
+  // positive = regression, red only when worse by more than 10%.
+  if (pctChange < 0) {
+    impactText = '✅ Improved'
     impactColor = 'text-green-600'
-  } else if (Math.abs(pctChange) < 15) {
-    impactText = '⚠️ Moderate (5-15%)'
-    impactColor = 'text-yellow-600'
+  } else if (pctChange <= 10) {
+    impactText = '⚠️ Slightly worse (≤10%)'
+    impactColor = 'text-gray-600'
   } else {
-    impactText = '❌ Significant (>15%)'
+    impactText = '❌ Worse (>10%)'
     impactColor = 'text-red-600'
   }
 
@@ -250,15 +252,22 @@ export function ResultsSection({ results, autoDetectResults = {} }: ResultsSecti
               const unit = m.unit || ''
               const isRtf = m.name.includes('RTF')
               const precision = isRtf ? 3 : 1
+              // Lower latency is better: negative change = improvement (green);
+              // positive change = regression, red only when it worsens by more than 10%.
+              const changeColor = pct < 0
+                ? 'text-green-600'
+                : pct > 10
+                  ? 'text-red-600 font-semibold'
+                  : 'text-gray-600'
               return (
                 <tr key={m.name} className="hover:bg-gray-50">
                   <td className="p-2 border-b">{m.name}</td>
                   <td className="p-2 border-b font-mono">{m.baseVal.toFixed(precision)}{unit ? ` ${unit}` : ''}</td>
                   <td className="p-2 border-b font-mono">{m.targetVal.toFixed(precision)}{unit ? ` ${unit}` : ''}</td>
-                  <td className={`p-2 border-b font-mono ${delta > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                  <td className={`p-2 border-b font-mono ${changeColor}`}>
                     {delta >= 0 ? '+' : ''}{delta.toFixed(precision)}{unit ? ` ${unit}` : ''}
                   </td>
-                  <td className={`p-2 border-b font-mono ${Math.abs(pct) > 5 ? 'text-red-600 font-semibold' : 'text-green-600'}`}>
+                  <td className={`p-2 border-b font-mono ${changeColor}`}>
                     {pct >= 0 ? '+' : ''}{pct.toFixed(1)}%
                   </td>
                 </tr>

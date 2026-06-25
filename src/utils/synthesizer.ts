@@ -35,6 +35,7 @@ interface RunTestOptions {
   testOrder?: TestOrder  // Execution order when testMode='compare'
   apiDelay?: number  // Delay in ms between API calls (default: 100)
   useHttpApi?: boolean  // Use HTTP REST API instead of WebSocket SDK
+  keepAudio?: boolean  // Keep audio data in results for later download (default false to save memory)
   onProgress: (current: number, total: number, label: string) => void
   onResult: (result: TestResult) => void
   signal: AbortSignal
@@ -230,7 +231,7 @@ async function synthesizeWithLatencyTracking(
 }
 
 export async function runPerformanceTest(options: RunTestOptions): Promise<TestResult[]> {
-  const { ssmls, iterations, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, testMode = 'compare', testOrder = 'baseFirst', apiDelay = 100, useHttpApi = false, onProgress, onResult, signal } = options
+  const { ssmls, iterations, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, testMode = 'compare', testOrder = 'baseFirst', apiDelay = 100, useHttpApi = false, keepAudio = false, onProgress, onResult, signal } = options
 
   // Convert null to undefined for provenanceMode (null means use server default)
   const targetProvenanceMode: ProvenanceMode = targetProvenanceEnabled ?? undefined
@@ -360,6 +361,11 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
             isTargetEndpoint: config.isTarget,
             ...synthesisResult,
             timestamp: new Date().toISOString(),
+          }
+
+          // Drop audio data to save memory unless the caller wants to keep it for download
+          if (!keepAudio) {
+            result.audioData = undefined
           }
 
           results.push(result)

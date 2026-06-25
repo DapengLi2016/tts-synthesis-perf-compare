@@ -1,6 +1,26 @@
-import { REGIONS, VOICES, OUTPUT_FORMATS, PRESET_ENDPOINTS } from '../constants'
+import { REGIONS, VOICES, OUTPUT_FORMATS, PRESET_ENDPOINTS, REGION_PRESET_ENDPOINTS, ALL_PRESET_ENDPOINTS } from '../constants'
 import { TestMode, DetectAuthType, TestOrder } from '../utils/storage'
 import { useState, useCallback, useMemo } from 'react'
+
+// Renders the preset <option> groups (local + Azure regions) shared by the
+// single/base/target endpoint selectors.
+function EndpointPresetOptions() {
+  return (
+    <>
+      <option value="">-- Select preset --</option>
+      <optgroup label="Local">
+        {PRESET_ENDPOINTS.map(ep => (
+          <option key={ep.value} value={ep.value}>{ep.label}</option>
+        ))}
+      </optgroup>
+      <optgroup label="Azure Regions">
+        {REGION_PRESET_ENDPOINTS.map(ep => (
+          <option key={ep.value} value={ep.value}>{ep.label}</option>
+        ))}
+      </optgroup>
+    </>
+  )
+}
 
 interface ConfigPanelProps {
   endpointType: 'region' | 'custom'
@@ -33,6 +53,8 @@ interface ConfigPanelProps {
   setIterations: (v: number) => void
   warmupRuns: number
   setWarmupRuns: (v: number) => void
+  keepAudio: boolean
+  setKeepAudio: (v: boolean) => void
   enableCache: boolean
   setEnableCache: (v: boolean) => void
   detectUrl: string
@@ -90,6 +112,7 @@ export function ConfigPanel({
   ssmlCount, setSsmlCount,
   iterations, setIterations,
   warmupRuns, setWarmupRuns,
+  keepAudio, setKeepAudio,
   enableCache, setEnableCache,
   detectUrl, setDetectUrl,
   detectAuthType, setDetectAuthType,
@@ -234,14 +257,11 @@ export function ConfigPanel({
               <>
                 <div className="flex gap-2">
                   <select
-                    value={PRESET_ENDPOINTS.some(p => p.value === customEndpoint) ? customEndpoint : ''}
+                    value={ALL_PRESET_ENDPOINTS.some(p => p.value === customEndpoint) ? customEndpoint : ''}
                     onChange={e => e.target.value && setCustomEndpoint(e.target.value)}
                     className="p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
                   >
-                    <option value="">-- Select preset --</option>
-                    {PRESET_ENDPOINTS.map(ep => (
-                      <option key={ep.value} value={ep.value}>{ep.label}</option>
-                    ))}
+                    <EndpointPresetOptions />
                   </select>
                   <input
                     type="text"
@@ -251,7 +271,7 @@ export function ConfigPanel({
                     className="flex-1 p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
                   />
                 </div>
-                <small className="text-gray-500 text-sm">Select from preset or enter custom URL</small>
+                <small className="text-gray-500 text-sm">Select a local preset or Azure region, or enter a custom URL</small>
               </>
             ) : (
               // Dual endpoint mode
@@ -262,14 +282,11 @@ export function ConfigPanel({
                   </label>
                   <div className="flex gap-2">
                     <select
-                      value={PRESET_ENDPOINTS.some(p => p.value === baseEndpoint) ? baseEndpoint : ''}
+                      value={ALL_PRESET_ENDPOINTS.some(p => p.value === baseEndpoint) ? baseEndpoint : ''}
                       onChange={e => e.target.value && setBaseEndpoint(e.target.value)}
                       className="p-2 border border-gray-300 rounded-md focus:border-gray-500 focus:ring-1 focus:ring-gray-500 text-sm bg-white"
                     >
-                      <option value="">-- Select preset --</option>
-                      {PRESET_ENDPOINTS.map(ep => (
-                        <option key={ep.value} value={ep.value}>{ep.label}</option>
-                      ))}
+                      <EndpointPresetOptions />
                     </select>
                     <input
                       type="text"
@@ -287,14 +304,11 @@ export function ConfigPanel({
                   </label>
                   <div className="flex gap-2">
                     <select
-                      value={PRESET_ENDPOINTS.some(p => p.value === targetEndpoint) ? targetEndpoint : ''}
+                      value={ALL_PRESET_ENDPOINTS.some(p => p.value === targetEndpoint) ? targetEndpoint : ''}
                       onChange={e => e.target.value && setTargetEndpoint(e.target.value)}
                       className="p-2 border border-blue-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm bg-white"
                     >
-                      <option value="">-- Select preset --</option>
-                      {PRESET_ENDPOINTS.map(ep => (
-                        <option key={ep.value} value={ep.value}>{ep.label}</option>
-                      ))}
+                      <EndpointPresetOptions />
                     </select>
                     <input
                       type="text"
@@ -584,6 +598,22 @@ export function ConfigPanel({
           />
           <small className="text-gray-500 text-sm">Warmup runs before test (both ON/OFF)</small>
         </div>
+      </div>
+
+      {/* Keep audio for download */}
+      <div className="mb-4 p-3 bg-gray-50 rounded-md">
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={keepAudio}
+            onChange={e => setKeepAudio(e.target.checked)}
+            className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
+          />
+          <span className="text-sm">保留合成音频以供下载（Keep audio for download）</span>
+        </label>
+        <small className="block text-gray-500 text-sm mt-1">
+          默认关闭以节省内存。测试次数较多时建议保持关闭；开启后可在结果区下载音频。（水印校验需要音频时会临时保留并在完成后释放）
+        </small>
       </div>
 
       {/* Row 4.3: SSML Options */}

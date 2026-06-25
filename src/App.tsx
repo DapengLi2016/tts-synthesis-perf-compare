@@ -109,6 +109,7 @@ function App() {
   const [ssmlCount, setSsmlCount] = useState(urlParams.ssmlCount || savedConfig.ssmlCount || 50)
   const [iterations, setIterations] = useState(urlParams.iterations || savedConfig.iterations || 1)
   const [warmupRuns, setWarmupRuns] = useState(urlParams.warmup ?? savedConfig.warmupRuns ?? 1)
+  const [keepAudio, setKeepAudio] = useState(savedConfig.keepAudio ?? false)
   const [enableCache, setEnableCache] = useState(savedConfig.enableCache ?? true)
   const [detectUrl, setDetectUrl] = useState(savedConfig.detectUrl || '')
   const [detectAuthType, setDetectAuthType] = useState<DetectAuthType>(savedConfig.detectAuthType || 'apiKey')
@@ -162,6 +163,7 @@ function App() {
         ssmlCount,
         iterations,
         warmupRuns,
+        keepAudio,
         enableCache,
         detectUrl,
         detectAuthType,
@@ -179,7 +181,7 @@ function App() {
         inlineAudioSasToken,
       })
     }
-  }, [endpointType, region, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled, subscriptionKey, accessToken, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, enableCache, detectUrl, detectAuthType, detectToken, verifyWatermark, detectMaxCount, testMode, testOrder, apiDelay, useHttpApi, useMultiVoice, backgroundAudioUrl, inlineAudioUrl, bgmSasToken, inlineAudioSasToken])
+  }, [endpointType, region, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled, subscriptionKey, accessToken, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, keepAudio, enableCache, detectUrl, detectAuthType, detectToken, verifyWatermark, detectMaxCount, testMode, testOrder, apiDelay, useHttpApi, useMultiVoice, backgroundAudioUrl, inlineAudioUrl, bgmSasToken, inlineAudioSasToken])
 
   const addLog = useCallback((message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
     setLogs(prev => [...prev, { timestamp: new Date(), message, type }])
@@ -216,6 +218,7 @@ function App() {
     setSsmlCount(50)
     setIterations(1)
     setWarmupRuns(1)
+    setKeepAudio(false)
     setEnableCache(true)
     setDetectUrl('')
     setDetectAuthType('apiKey')
@@ -247,6 +250,12 @@ function App() {
   }, [ssmlCount, voiceName, useMultiVoice, backgroundAudioUrl, inlineAudioUrl, bgmSasToken, inlineAudioSasToken, addLog])
 
   const handleStartTest = useCallback(async () => {
+    // Clear previously generated audio and historical synthesis results on every click
+    setResults([])
+    setAutoDetectResults({})
+    setProgress(0)
+    addLog('🧹 Cleared previous audio and synthesis results', 'info')
+
     if (!subscriptionKey) {
       addLog('❌ Please enter a subscription key', 'error')
       return
@@ -289,9 +298,6 @@ function App() {
     const controller = new AbortController()
     setAbortController(controller)
     setIsRunning(true)
-    setResults([])
-    setAutoDetectResults({})
-    setProgress(0)
 
     const endpoint = endpointType === 'custom' ? customEndpoint : null
     const regionValue = endpointType === 'region' ? region : null
@@ -348,6 +354,8 @@ function App() {
         testOrder,
         apiDelay,
         useHttpApi,
+        // Keep audio when the user wants to download it, or when watermark verification needs it
+        keepAudio: keepAudio || verifyWatermark,
         onProgress: (current, total, label) => {
           setProgress((current / total) * 100)
           setCurrentTest(label)
@@ -495,8 +503,13 @@ function App() {
       setIsVerifying(false)
       setAbortController(null)
       setCurrentTest('')
+      // Free audio memory if the user did not opt to keep it for download
+      // (audio may have been retained temporarily for watermark verification)
+      if (!keepAudio) {
+        setResults(prev => prev.map(r => (r.audioData ? { ...r, audioData: undefined } : r)))
+      }
     }
-  }, [subscriptionKey, accessToken, ssmls, endpointType, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, region, iterations, warmupRuns, outputFormat, testMode, testOrder, apiDelay, useHttpApi, verifyWatermark, detectMaxCount, detectUrl, detectAuthType, detectToken, addLog])
+  }, [subscriptionKey, accessToken, ssmls, endpointType, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, region, iterations, warmupRuns, outputFormat, testMode, testOrder, apiDelay, useHttpApi, keepAudio, verifyWatermark, detectMaxCount, detectUrl, detectAuthType, detectToken, addLog])
 
   const handleStopTest = useCallback(() => {
     abortController?.abort()
@@ -547,6 +560,8 @@ function App() {
           setIterations={setIterations}
           warmupRuns={warmupRuns}
           setWarmupRuns={setWarmupRuns}
+          keepAudio={keepAudio}
+          setKeepAudio={setKeepAudio}
           enableCache={enableCache}
           setEnableCache={setEnableCache}
           detectUrl={detectUrl}

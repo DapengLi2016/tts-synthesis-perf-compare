@@ -23,6 +23,7 @@ export interface ConfigData {
   ssmlCount?: number
   iterations?: number
   warmupRuns?: number
+  keepAudio?: boolean  // Keep synthesized audio in memory for later download (default false to save memory)
   enableCache?: boolean
   detectUrl?: string
   detectAuthType?: DetectAuthType  // 'apiKey' or 'token'
