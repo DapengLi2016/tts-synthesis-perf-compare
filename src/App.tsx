@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { ConfigPanel } from './components/ConfigPanel'
 import { SsmlPreview } from './components/SsmlPreview'
 import { ProgressSection } from './components/ProgressSection'
@@ -9,7 +9,7 @@ import { generateSsmls, SsmlData } from './utils/ssmlGenerator'
 import { runPerformanceTest, runWarmup, TestResult } from './utils/synthesizer'
 import { detectWatermarkWithKey, detectWatermarkWithToken, DetectResult, isRawFormat, parseAudioFormat, addWavHeader } from './utils/detect'
 import { LogEntry } from './types'
-import { loadConfig, saveConfig, clearConfig, TestMode, DetectAuthType, TestOrder } from './utils/storage'
+import { loadConfig, saveConfig, clearConfig, TestMode, DetectAuthType, TestOrder, Protocol, loadSubKey, saveSubKey } from './utils/storage'
 
 /**
  * Parse URL parameters to override config.
@@ -36,6 +36,7 @@ function parseUrlParams(): Partial<{
   iterations: number
   warmup: number
   useHttpApi: boolean
+  protocol: Protocol
   key: string
 }> {
   const params = new URLSearchParams(window.location.search)
@@ -80,6 +81,11 @@ function parseUrlParams(): Partial<{
   if (useHttpApi === 'true') result.useHttpApi = true
   if (useHttpApi === 'false') result.useHttpApi = false
 
+  const protocol = params.get('protocol')
+  if (protocol === 'websocket' || protocol === 'http' || protocol === 'bidirectional') {
+    result.protocol = protocol
+  }
+
   const key = params.get('key')
   if (key) result.key = key
 
@@ -92,9 +98,9 @@ function App() {
   const urlParams = parseUrlParams()
 
   // Config state (URL params override saved config)
-  const [endpointType, setEndpointType] = useState<'region' | 'custom'>(
-    urlParams.endpoint ? 'custom' : (savedConfig.endpointType || 'region')
-  )
+  // Endpoint type is always 'custom' now — the preset dropdowns already include
+  // both local presets and Azure regions, so a separate region mode is unnecessary.
+  const [endpointType, setEndpointType] = useState<'region' | 'custom'>('custom')
   const [region, setRegion] = useState(urlParams.region || savedConfig.region || 'eastus')
   const [customEndpoint, setCustomEndpoint] = useState(urlParams.endpoint || savedConfig.customEndpoint || 'ws://localhost:12345/cognitiveservices/websocket/v1')
   const [useDualEndpoints, setUseDualEndpoints] = useState(savedConfig.useDualEndpoints ?? false)
@@ -120,6 +126,47 @@ function App() {
   const [testOrder, setTestOrder] = useState<TestOrder>(savedConfig.testOrder || 'baseFirst')
   const [apiDelay, setApiDelay] = useState(savedConfig.apiDelay ?? 100)
   const [useHttpApi, setUseHttpApi] = useState(urlParams.useHttpApi ?? savedConfig.useHttpApi ?? false)
+  // Synthesis protocol (supersedes useHttpApi). Falls back to legacy useHttpApi for old saved configs.
+  const [protocol, setProtocol] = useState<Protocol>(
+    urlParams.protocol ?? savedConfig.protocol ?? ((urlParams.useHttpApi ?? savedConfig.useHttpApi) ? 'http' : 'websocket')
+  )
+  // Keep the legacy useHttpApi flag in sync with the selected protocol for backward compatibility.
+  useEffect(() => {
+    setUseHttpApi(protocol === 'http')
+  }, [protocol])
+
+  // --- Per-endpoint subscription key ---
+  // The subscription key follows the selected region / custom endpoint. The
+  // "endpoint key" is the region name (region mode) or the custom endpoint URL.
+  const currentEndpointKeyRef = useRef('')
+  currentEndpointKeyRef.current = endpointType === 'custom' ? customEndpoint : region
+
+  // Persist the current key under the active endpoint whenever the user edits it.
+  // (Keyed only on subscriptionKey so typing the endpoint URL never pollutes the store.)
+  useEffect(() => {
+    saveSubKey(currentEndpointKeyRef.current, subscriptionKey)
+  }, [subscriptionKey])
+
+  // Restore the saved key for a newly selected region.
+  const handleRegionChange = useCallback((newRegion: string) => {
+    setRegion(newRegion)
+    setSubscriptionKey(loadSubKey(newRegion))
+  }, [])
+
+  // Restore the saved key when toggling between region and custom endpoint.
+  const handleEndpointTypeChange = useCallback((newType: 'region' | 'custom') => {
+    setEndpointType(newType)
+    const newKey = newType === 'custom' ? customEndpoint : region
+    setSubscriptionKey(loadSubKey(newKey))
+  }, [customEndpoint, region])
+
+  // Restore the saved key when a custom endpoint is committed (blur / preset / history select).
+  const activeCustomEndpointRef = useRef(customEndpoint)
+  const handleCustomEndpointCommit = useCallback((url: string) => {
+    if (url === activeCustomEndpointRef.current) return
+    activeCustomEndpointRef.current = url
+    setSubscriptionKey(loadSubKey(url))
+  }, [])
   
   // SSML options
   const [useMultiVoice, setUseMultiVoice] = useState(savedConfig.useMultiVoice ?? true)
@@ -174,6 +221,7 @@ function App() {
         testOrder,
         apiDelay,
         useHttpApi,
+        protocol,
         useMultiVoice,
         backgroundAudioUrl,
         inlineAudioUrl,
@@ -181,7 +229,7 @@ function App() {
         inlineAudioSasToken,
       })
     }
-  }, [endpointType, region, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled, subscriptionKey, accessToken, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, keepAudio, enableCache, detectUrl, detectAuthType, detectToken, verifyWatermark, detectMaxCount, testMode, testOrder, apiDelay, useHttpApi, useMultiVoice, backgroundAudioUrl, inlineAudioUrl, bgmSasToken, inlineAudioSasToken])
+  }, [endpointType, region, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled, subscriptionKey, accessToken, voiceName, outputFormat, ssmlCount, iterations, warmupRuns, keepAudio, enableCache, detectUrl, detectAuthType, detectToken, verifyWatermark, detectMaxCount, testMode, testOrder, apiDelay, useHttpApi, protocol, useMultiVoice, backgroundAudioUrl, inlineAudioUrl, bgmSasToken, inlineAudioSasToken])
 
   const addLog = useCallback((message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
     setLogs(prev => [...prev, { timestamp: new Date(), message, type }])
@@ -203,7 +251,7 @@ function App() {
   const handleClearCache = useCallback(() => {
     clearConfig()
     // Reset to defaults
-    setEndpointType('region')
+    setEndpointType('custom')
     setRegion('eastus')
     setCustomEndpoint('ws://localhost:12345/cognitiveservices/websocket/v1')
     setUseDualEndpoints(false)
@@ -333,6 +381,8 @@ function App() {
           useDualEndpoints: useDualEndpoints && endpointType === 'custom',
           region: regionValue,
           outputFormat,
+          protocol,
+          voiceName,
           onLog: (msg) => addLog(msg, 'info'),
           signal: controller.signal,
         })
@@ -354,6 +404,8 @@ function App() {
         testOrder,
         apiDelay,
         useHttpApi,
+        protocol,
+        voiceName,
         // Keep audio when the user wants to download it, or when watermark verification needs it
         keepAudio: keepAudio || verifyWatermark,
         onProgress: (current, total, label) => {
@@ -366,7 +418,7 @@ function App() {
           const status = result.success ? '✓' : '✗'
           const logType = result.success ? 'success' : 'error'
           const endpointLabel = result.isTargetEndpoint ? 'Target' : 'Base'
-          const provLabel = result.provenanceEnabled ? 'prov=ON' : result.provenanceEnabled === false ? 'prov=OFF' : 'prov=default'
+          const provLabel = result.provenanceMode === undefined ? 'prov=default' : result.provenanceMode ? 'prov=ON' : 'prov=OFF'
           const msg = result.success
             ? `${status} SSML ${result.ssmlIndex}, ${endpointLabel}(${provLabel}): FirstByte=${result.firstByteLatencyMs?.toFixed(1)}ms, LastByte=${result.lastByteLatencyMs?.toFixed(1)}ms`
             : `${status} SSML ${result.ssmlIndex}, ${endpointLabel}(${provLabel}): ${result.error}`
@@ -509,7 +561,7 @@ function App() {
         setResults(prev => prev.map(r => (r.audioData ? { ...r, audioData: undefined } : r)))
       }
     }
-  }, [subscriptionKey, accessToken, ssmls, endpointType, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, region, iterations, warmupRuns, outputFormat, testMode, testOrder, apiDelay, useHttpApi, keepAudio, verifyWatermark, detectMaxCount, detectUrl, detectAuthType, detectToken, addLog])
+  }, [subscriptionKey, accessToken, ssmls, endpointType, customEndpoint, useDualEndpoints, baseEndpoint, targetEndpoint, region, iterations, warmupRuns, outputFormat, testMode, testOrder, apiDelay, useHttpApi, protocol, voiceName, keepAudio, verifyWatermark, detectMaxCount, detectUrl, detectAuthType, detectToken, addLog])
 
   const handleStopTest = useCallback(() => {
     abortController?.abort()
@@ -531,11 +583,12 @@ function App() {
         {/* Config Panel */}
         <ConfigPanel
           endpointType={endpointType}
-          setEndpointType={setEndpointType}
+          setEndpointType={handleEndpointTypeChange}
           region={region}
-          setRegion={setRegion}
+          setRegion={handleRegionChange}
           customEndpoint={customEndpoint}
           setCustomEndpoint={setCustomEndpoint}
+          onCustomEndpointCommit={handleCustomEndpointCommit}
           useDualEndpoints={useDualEndpoints}
           setUseDualEndpoints={setUseDualEndpoints}
           baseEndpoint={baseEndpoint}
@@ -580,8 +633,8 @@ function App() {
           setTestOrder={setTestOrder}
           apiDelay={apiDelay}
           setApiDelay={setApiDelay}
-          useHttpApi={useHttpApi}
-          setUseHttpApi={setUseHttpApi}
+          protocol={protocol}
+          setProtocol={setProtocol}
           useMultiVoice={useMultiVoice}
           setUseMultiVoice={setUseMultiVoice}
           backgroundAudioUrl={backgroundAudioUrl}

@@ -1,6 +1,6 @@
-import { REGIONS, VOICES, OUTPUT_FORMATS, PRESET_ENDPOINTS, REGION_PRESET_ENDPOINTS, ALL_PRESET_ENDPOINTS } from '../constants'
-import { TestMode, DetectAuthType, TestOrder } from '../utils/storage'
-import { useState, useCallback, useMemo } from 'react'
+import { VOICES, OUTPUT_FORMATS, PRESET_ENDPOINTS, REGION_PRESET_ENDPOINTS, ALL_PRESET_ENDPOINTS, PROTOCOL_LABELS, PROTOCOL_DEFAULT_PATHS, buildProtocolEndpoint } from '../constants'
+import { TestMode, DetectAuthType, TestOrder, Protocol, loadEndpointHistory, addEndpointHistory } from '../utils/storage'
+import { useState, useCallback, useMemo, useEffect } from 'react'
 
 // Renders the preset <option> groups (local + Azure regions) shared by the
 // single/base/target endpoint selectors.
@@ -29,6 +29,7 @@ interface ConfigPanelProps {
   setRegion: (v: string) => void
   customEndpoint: string
   setCustomEndpoint: (v: string) => void
+  onCustomEndpointCommit?: (url: string) => void
   useDualEndpoints: boolean
   setUseDualEndpoints: (v: boolean) => void
   baseEndpoint: string
@@ -73,8 +74,8 @@ interface ConfigPanelProps {
   setTestOrder: (v: TestOrder) => void
   apiDelay: number
   setApiDelay: (v: number) => void
-  useHttpApi: boolean
-  setUseHttpApi: (v: boolean) => void
+  protocol: Protocol
+  setProtocol: (v: Protocol) => void
   // SSML options
   useMultiVoice: boolean
   setUseMultiVoice: (v: boolean) => void
@@ -100,6 +101,7 @@ export function ConfigPanel({
   endpointType, setEndpointType,
   region, setRegion,
   customEndpoint, setCustomEndpoint,
+  onCustomEndpointCommit,
   useDualEndpoints, setUseDualEndpoints,
   baseEndpoint, setBaseEndpoint,
   targetEndpoint, setTargetEndpoint,
@@ -122,7 +124,7 @@ export function ConfigPanel({
   testMode, setTestMode,
   testOrder, setTestOrder,
   apiDelay, setApiDelay,
-  useHttpApi, setUseHttpApi,
+  protocol, setProtocol,
   useMultiVoice, setUseMultiVoice,
   backgroundAudioUrl, setBackgroundAudioUrl,
   inlineAudioUrl, setInlineAudioUrl,
@@ -136,6 +138,38 @@ export function ConfigPanel({
   const [copiedInlineCommand, setCopiedInlineCommand] = useState(false)
   const [copiedBgmUrl, setCopiedBgmUrl] = useState(false)
   const [copiedInlineUrl, setCopiedInlineUrl] = useState(false)
+
+  // Toggle to reveal the subscription key in plain text.
+  const [showSubKey, setShowSubKey] = useState(false)
+
+  // History of user-entered custom endpoint URLs (not in the preset list),
+  // persisted per-protocol in localStorage and offered as a datalist dropdown.
+  const [endpointHistory, setEndpointHistory] = useState<string[]>(() => loadEndpointHistory(protocol))
+
+  // Reload history whenever the active protocol changes (each protocol keeps its own list).
+  useEffect(() => {
+    setEndpointHistory(loadEndpointHistory(protocol))
+  }, [protocol])
+
+  // Commit a typed URL to history when it's a non-empty, non-preset value.
+  const commitEndpointHistory = useCallback((url: string) => {
+    const trimmed = url.trim()
+    if (!trimmed) return
+    if (ALL_PRESET_ENDPOINTS.some(p => p.value === trimmed)) return
+    setEndpointHistory(addEndpointHistory(protocol, trimmed))
+  }, [protocol])
+
+  // Switching protocol rewrites the endpoint(s) to the new protocol's default path,
+  // preserving the existing host:port where possible.
+  const handleProtocolChange = useCallback((newProtocol: Protocol) => {
+    setProtocol(newProtocol)
+    if (useDualEndpoints) {
+      setBaseEndpoint(buildProtocolEndpoint(baseEndpoint, newProtocol, 'localhost:12345'))
+      setTargetEndpoint(buildProtocolEndpoint(targetEndpoint, newProtocol, 'localhost:12346'))
+    } else {
+      setCustomEndpoint(buildProtocolEndpoint(customEndpoint, newProtocol))
+    }
+  }, [setProtocol, useDualEndpoints, baseEndpoint, targetEndpoint, customEndpoint, setBaseEndpoint, setTargetEndpoint, setCustomEndpoint])
 
   // Check if URL needs SAS
   const needsSas = backgroundAudioUrl && 
@@ -209,35 +243,16 @@ export function ConfigPanel({
     <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
       <h2 className="text-xl font-semibold text-blue-600 border-b-2 border-blue-600 pb-2 mb-4">⚙️ Configuration</h2>
 
-      {/* Row 1: Endpoint */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-        <div>
-          <label className="block font-semibold mb-1">Endpoint Type:</label>
-          <select
-            value={endpointType}
-            onChange={e => setEndpointType(e.target.value as 'region' | 'custom')}
-            className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-          >
-            <option value="region">Azure Region</option>
-            <option value="custom">Custom Endpoint</option>
-          </select>
-        </div>
+      {/* Saved custom endpoint URLs (user history), shared by all endpoint inputs */}
+      <datalist id="endpoint-history">
+        {endpointHistory.map(url => (
+          <option key={url} value={url} />
+        ))}
+      </datalist>
 
-        {endpointType === 'region' ? (
-          <div>
-            <label className="block font-semibold mb-1">Region:</label>
-            <select
-              value={region}
-              onChange={e => setRegion(e.target.value)}
-              className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            >
-              {REGIONS.map(r => (
-                <option key={r.value} value={r.value}>{r.label}</option>
-              ))}
-            </select>
-          </div>
-        ) : (
-          <div className="md:col-span-2">
+      {/* Row 1: Endpoint */}
+      <div className="mb-4">
+        <div>
             {/* Toggle for dual endpoints */}
             <div className="flex items-center gap-2 mb-2">
               <label className="block font-semibold">Custom Endpoint:</label>
@@ -258,7 +273,7 @@ export function ConfigPanel({
                 <div className="flex gap-2">
                   <select
                     value={ALL_PRESET_ENDPOINTS.some(p => p.value === customEndpoint) ? customEndpoint : ''}
-                    onChange={e => e.target.value && setCustomEndpoint(e.target.value)}
+                    onChange={e => { if (e.target.value) { setCustomEndpoint(e.target.value); onCustomEndpointCommit?.(e.target.value) } }}
                     className="p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
                   >
                     <EndpointPresetOptions />
@@ -267,6 +282,8 @@ export function ConfigPanel({
                     type="text"
                     value={customEndpoint}
                     onChange={e => setCustomEndpoint(e.target.value)}
+                    onBlur={e => { commitEndpointHistory(e.target.value); onCustomEndpointCommit?.(e.target.value) }}
+                    list="endpoint-history"
                     placeholder="ws://localhost:12345/cognitiveservices/websocket/v1"
                     className="flex-1 p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
                   />
@@ -292,6 +309,8 @@ export function ConfigPanel({
                       type="text"
                       value={baseEndpoint}
                       onChange={e => setBaseEndpoint(e.target.value)}
+                      onBlur={e => commitEndpointHistory(e.target.value)}
+                      list="endpoint-history"
                       placeholder="ws://localhost:12345/cognitiveservices/websocket/v1"
                       className="flex-1 p-2 border border-gray-300 rounded-md focus:border-gray-500 focus:ring-1 focus:ring-gray-500 text-sm"
                     />
@@ -314,6 +333,8 @@ export function ConfigPanel({
                       type="text"
                       value={targetEndpoint}
                       onChange={e => setTargetEndpoint(e.target.value)}
+                      onBlur={e => commitEndpointHistory(e.target.value)}
+                      list="endpoint-history"
                       placeholder="ws://localhost:12346/cognitiveservices/websocket/v1"
                       className="flex-1 p-2 border border-blue-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500 text-sm"
                     />
@@ -352,20 +373,42 @@ export function ConfigPanel({
                 </small>
               </div>
             )}
-          </div>
-        )}
+        </div>
       </div>
 
       {/* Row 2: Subscription Key */}
       <div className="mb-4">
         <label className="block font-semibold mb-1">Subscription Key:</label>
-        <input
-          type="password"
-          value={subscriptionKey}
-          onChange={e => setSubscriptionKey(e.target.value)}
-          placeholder="Enter your Azure Speech subscription key"
-          className="w-full p-2 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-        />
+        <div className="relative">
+          <input
+            type={showSubKey ? 'text' : 'password'}
+            value={subscriptionKey}
+            onChange={e => setSubscriptionKey(e.target.value)}
+            placeholder="Enter your Azure Speech subscription key"
+            className="w-full p-2 pr-10 border border-gray-300 rounded-md focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+          />
+          <button
+            type="button"
+            onClick={() => setShowSubKey(v => !v)}
+            aria-label={showSubKey ? 'Hide subscription key' : 'Show subscription key'}
+            title={showSubKey ? 'Hide subscription key' : 'Show subscription key'}
+            className="absolute inset-y-0 right-0 flex items-center px-3 text-gray-500 hover:text-gray-700"
+          >
+            {showSubKey ? (
+              // eye-off icon
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 3l18 18M10.584 10.587a2 2 0 002.828 2.83" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9.363 5.365A9.466 9.466 0 0112 5c4.638 0 8.573 3.007 9.963 7.178a1.012 1.012 0 010 .639 10.04 10.04 0 01-2.79 4.142M6.228 6.228A10.045 10.045 0 002.037 11.32a1.012 1.012 0 000 .639C3.423 16.49 7.36 19.5 12 19.5c1.51 0 2.948-.32 4.25-.897" />
+              </svg>
+            ) : (
+              // eye icon
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            )}
+          </button>
+        </div>
       </div>
 
       {/* Row 2.1: Access Token (optional) */}
@@ -847,20 +890,23 @@ export function ConfigPanel({
             )}
           </div>
 
-          {/* Row 4.7: Use HTTP API */}
+          {/* Row 4.7: Synthesis protocol */}
           <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-md">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={useHttpApi}
-                onChange={e => setUseHttpApi(e.target.checked)}
-                className="w-4 h-4 text-blue-600 rounded focus:ring-blue-500"
-              />
-              <span className="font-medium">Use HTTP REST API instead of WebSocket SDK</span>
-            </label>
-            <p className="text-sm text-gray-600 mt-1 ml-6">
-              WebSocket SDK uses <code className="bg-gray-200 px-1 rounded">provenance</code> URL query parameter.
-              HTTP REST API uses <code className="bg-gray-200 px-1 rounded">X-Microsoft-Provenance-Enabled</code> header.
+            <div className="flex items-center gap-2">
+              <span className="font-medium whitespace-nowrap">Protocol:</span>
+              <select
+                value={protocol}
+                onChange={e => handleProtocolChange(e.target.value as Protocol)}
+                className="flex-1 px-2 py-1 border rounded focus:ring-2 focus:ring-blue-500"
+              >
+                {(Object.keys(PROTOCOL_LABELS) as Protocol[]).map(p => (
+                  <option key={p} value={p}>{PROTOCOL_LABELS[p]}</option>
+                ))}
+              </select>
+            </div>
+            <p className="text-sm text-gray-600 mt-1">
+              Default endpoint path: <code className="bg-gray-200 px-1 rounded">{PROTOCOL_DEFAULT_PATHS[protocol]}</code>.
+              Switching protocol rewrites the endpoint path (host:port preserved); you can still type a custom endpoint.
             </p>
           </div>
 

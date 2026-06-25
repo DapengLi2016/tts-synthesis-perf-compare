@@ -1,3 +1,5 @@
+import type { Protocol } from './utils/storage'
+
 export const REGIONS = [
   { value: 'australiaeast', label: 'Australia East' },
   { value: 'brazilsouth', label: 'Brazil South' },
@@ -63,6 +65,52 @@ export const REGION_PRESET_ENDPOINTS = REGIONS.map(r => ({
 // Combined preset list (local + regions) used to detect whether the current
 // endpoint value matches a known preset.
 export const ALL_PRESET_ENDPOINTS = [...PRESET_ENDPOINTS, ...REGION_PRESET_ENDPOINTS]
+
+// --- Protocol default endpoint paths ---
+
+// Default endpoint path for each synthesis protocol.
+export const PROTOCOL_DEFAULT_PATHS: Record<Protocol, string> = {
+  websocket: '/cognitiveservices/websocket/v1',
+  bidirectional: '/tts/cognitiveservices/websocket/v2',
+  http: '/synthesize',
+}
+
+export const PROTOCOL_LABELS: Record<Protocol, string> = {
+  websocket: 'WebSocket (v1)',
+  http: 'HTTP REST (/synthesize)',
+  bidirectional: 'Bidirectional (v2)',
+}
+
+const DEFAULT_LOCAL_HOST = 'localhost:12345'
+
+function isLocalHost(host: string): boolean {
+  return host.startsWith('localhost') || host.startsWith('127.0.0.1')
+}
+
+/**
+ * Build the default endpoint URL for a protocol, preserving the host:port of the
+ * current endpoint when possible. The scheme is chosen from the protocol
+ * (ws/wss for websocket & bidirectional, http/https for http) and the path is
+ * replaced with the protocol's default path.
+ * e.g. ('ws://localhost:12346/x', 'bidirectional') -> 'ws://localhost:12346/tts/cognitiveservices/websocket/v2'
+ */
+export function buildProtocolEndpoint(currentEndpoint: string, protocol: Protocol, fallbackHost: string = DEFAULT_LOCAL_HOST): string {
+  let host = fallbackHost
+  try {
+    if (currentEndpoint) {
+      host = new URL(currentEndpoint).host || fallbackHost
+    }
+  } catch {
+    host = fallbackHost
+  }
+  const local = isLocalHost(host)
+  const path = PROTOCOL_DEFAULT_PATHS[protocol]
+  if (protocol === 'http') {
+    return `${local ? 'http' : 'https'}://${host}${path}`
+  }
+  return `${local ? 'ws' : 'wss'}://${host}${path}`
+}
+
 
 export const VOICES = [
   'en-US-AvaNeural',

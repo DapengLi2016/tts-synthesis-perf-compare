@@ -1,11 +1,12 @@
 import * as SpeechSDK from 'microsoft-cognitiveservices-speech-sdk'
 import { SsmlData } from './ssmlGenerator'
-import { TestMode, TestOrder } from './storage'
+import { TestMode, TestOrder, Protocol } from './storage'
 
 export interface TestResult {
   ssmlIndex: number
   iteration: number
-  provenanceEnabled: boolean  // Whether provenance was enabled for this test
+  provenanceEnabled: boolean  // Whether provenance was explicitly enabled (true) for this test
+  provenanceMode?: boolean  // Requested provenance mode: true=ON, false=OFF, undefined=server default
   isTargetEndpoint: boolean  // true = target FE, false = base FE
   firstByteLatencyMs?: number
   lastByteLatencyMs?: number
@@ -34,7 +35,9 @@ interface RunTestOptions {
   testMode?: TestMode
   testOrder?: TestOrder  // Execution order when testMode='compare'
   apiDelay?: number  // Delay in ms between API calls (default: 100)
-  useHttpApi?: boolean  // Use HTTP REST API instead of WebSocket SDK
+  useHttpApi?: boolean  // Deprecated: use HTTP REST API instead of WebSocket SDK (superseded by `protocol`)
+  protocol?: Protocol  // Synthesis protocol: 'websocket' | 'http' | 'bidirectional' (default 'websocket')
+  voiceName?: string  // Voice name, required for bidirectional text streaming (v2)
   keepAudio?: boolean  // Keep audio data in results for later download (default false to save memory)
   onProgress: (current: number, total: number, label: string) => void
   onResult: (result: TestResult) => void
@@ -55,9 +58,8 @@ const OUTPUT_FORMAT_MAP: Record<string, SpeechSDK.SpeechSynthesisOutputFormat> =
 // Provenance mode: undefined = don't set header (server default), false = set to false, true = set to true
 type ProvenanceMode = boolean | undefined
 
-// Request parameter/header names (matching Frontend's RequestVariants and RequestHeaders)
-const PROVENANCE_QUERY_PARAM = 'provenance'  // URL query parameter for WebSocket SDK
-const PROVENANCE_HEADER = 'X-Microsoft-Provenance-Enabled'  // HTTP header for REST API
+// Request parameter names (matching Frontend's RequestVariants)
+const PROVENANCE_QUERY_PARAM = 'provenance'  // URL query parameter for provenance control
 const SETFEATURE_QUERY_PARAM = 'setfeature'  // URL query parameter for enabling flights
 const PROVENANCE_FLIGHT_NAME = 'ttsfrontend-provenance'  // Flight name for provenance feature
 
@@ -104,7 +106,8 @@ function getRegionHttpEndpoint(region: string): string {
 
 /**
  * Synthesize using HTTP REST API.
- * Uses X-Microsoft-Provenance-Enabled HTTP header for provenance control.
+ * Uses the 'provenance' URL query parameter for provenance control (same as the
+ * WebSocket/bidirectional protocols) — no HTTP header is used.
  */
 async function synthesizeWithHttpApi(
   httpEndpoint: string,
@@ -112,6 +115,7 @@ async function synthesizeWithHttpApi(
   ssml: string,
   outputFormat: string,
   provenanceMode: ProvenanceMode,
+  flightEnabled: boolean,
   signal?: AbortSignal
 ): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>> {
   const startTime = performance.now()
@@ -121,15 +125,20 @@ async function synthesizeWithHttpApi(
     'Content-Type': 'application/ssml+xml',
     'X-Microsoft-OutputFormat': outputFormat,
   }
-  
-  // Set provenance header if specified
+
+  // Provenance (and flight) are passed via URL query parameters, consistent with
+  // the WebSocket/bidirectional protocols.
+  const requestUrl = new URL(httpEndpoint)
+  if (flightEnabled) {
+    requestUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
+  }
   if (provenanceMode !== undefined) {
-    headers[PROVENANCE_HEADER] = provenanceMode ? 'true' : 'false'
+    requestUrl.searchParams.set(PROVENANCE_QUERY_PARAM, provenanceMode ? 'true' : 'false')
   }
   
-  console.log(`HTTP API: ${httpEndpoint}, Provenance=${provenanceMode}`)
+  console.log(`HTTP API: ${requestUrl.toString()}, Provenance=${provenanceMode}`)
   
-  const response = await fetch(httpEndpoint, {
+  const response = await fetch(requestUrl.toString(), {
     method: 'POST',
     headers,
     body: ssml,
@@ -230,8 +239,83 @@ async function synthesizeWithLatencyTracking(
   })
 }
 
+/**
+ * Synthesize using the bidirectional v2 text-streaming API.
+ * Connects to the endpoint as-is (expected path: /tts/cognitiveservices/websocket/v2),
+ * streams plain text via SpeechSynthesisRequest, and measures audio chunk latency.
+ */
+async function synthesizeWithBidirectional(
+  speechConfig: SpeechSDK.SpeechConfig,
+  text: string,
+  provenanceMode: ProvenanceMode,
+  outputFormat: string
+): Promise<Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>> {
+  return new Promise((resolve, reject) => {
+    const synthesizer = new SpeechSDK.SpeechSynthesizer(speechConfig, null as any)
+    const sampleRate = getSampleRateFromFormat(outputFormat)
+
+    const startTime = performance.now()
+    let firstByteTime: number | null = null
+    let totalBytes = 0
+    let chunkCount = 0
+    let maxRtf = 0
+
+    synthesizer.synthesizing = (_s, e) => {
+      const elapsedMs = performance.now() - startTime
+      if (firstByteTime === null && e.result.audioData && e.result.audioData.byteLength > 0) {
+        firstByteTime = elapsedMs
+      }
+      totalBytes += e.result.audioData.byteLength
+      chunkCount++
+      if (chunkCount > 1) {
+        const rtf = calcRtf(sampleRate, totalBytes, elapsedMs)
+        if (rtf > maxRtf) {
+          maxRtf = rtf
+        }
+      }
+    }
+
+    const request = new SpeechSDK.SpeechSynthesisRequest(SpeechSDK.SpeechSynthesisRequestInputType.TextStream)
+
+    synthesizer.speakAsync(
+      request,
+      result => {
+        const lastByteTime = performance.now() - startTime
+        synthesizer.close()
+
+        if (result.reason === SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
+          resolve({
+            success: true,
+            firstByteLatencyMs: firstByteTime || lastByteTime,
+            lastByteLatencyMs: lastByteTime,
+            totalBytes: result.audioData.byteLength,
+            chunkCount,
+            maxRtf: maxRtf > 0 ? maxRtf : calcRtf(sampleRate, result.audioData.byteLength, lastByteTime),
+            provenanceEnabled: provenanceMode === true,
+            audioData: result.audioData.slice(0),
+            requestId: result.resultId,
+          })
+        } else {
+          reject(new Error(`Bidirectional synthesis failed: ${result.errorDetails || 'Unknown error'}`))
+        }
+      },
+      error => {
+        synthesizer.close()
+        reject(error)
+      }
+    )
+
+    // Stream the text then signal end-of-stream.
+    request.inputStream.write(text)
+    request.inputStream.close()
+  })
+}
+
 export async function runPerformanceTest(options: RunTestOptions): Promise<TestResult[]> {
-  const { ssmls, iterations, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, testMode = 'compare', testOrder = 'baseFirst', apiDelay = 100, useHttpApi = false, keepAudio = false, onProgress, onResult, signal } = options
+  const { ssmls, iterations, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, testMode = 'compare', testOrder = 'baseFirst', apiDelay = 100, useHttpApi = false, protocol = (useHttpApi ? 'http' : 'websocket'), voiceName, keepAudio = false, onProgress, onResult, signal } = options
+
+  const isHttp = protocol === 'http'
+  const isBidirectional = protocol === 'bidirectional'
 
   // Convert null to undefined for provenanceMode (null means use server default)
   const targetProvenanceMode: ProvenanceMode = targetProvenanceEnabled ?? undefined
@@ -280,14 +364,18 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
 
   // Helper to get HTTP endpoint from config
   const getHttpEndpoint = (config: EndpointConfig): string | null => {
-    if (!useHttpApi) return null
+    if (!isHttp) return null
     if (config.endpoint) {
+      // If the endpoint is already an HTTP(S) URL (e.g. .../synthesize), use it as-is.
+      if (/^https?:\/\//i.test(config.endpoint)) {
+        return config.endpoint
+      }
       return wsToHttpEndpoint(config.endpoint)
     }
     return region ? getRegionHttpEndpoint(region) : null
   }
 
-  console.log(`Running tests: useHttpApi=${useHttpApi}, useDualEndpoints=${useDualEndpoints}, testMode=${testMode}, endpoint=${endpoint || region}`)
+  console.log(`Running tests: protocol=${protocol}, useDualEndpoints=${useDualEndpoints}, testMode=${testMode}, endpoint=${endpoint || region}`)
 
   for (let iter = 0; iter < iterations; iter++) {
     for (let i = 0; i < ssmls.length; i++) {
@@ -303,56 +391,54 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
         }
 
         const currentEndpoint = config.endpoint
-        const testLabel = `SSML ${ssmlData.index}/${ssmls.length}, Iter ${iter + 1}/${iterations}, ${getConfigLabel(config)}${useHttpApi ? ' (HTTP)' : ''}${useDualEndpoints ? ` [${currentEndpoint ? new URL(currentEndpoint).host : region}]` : ''}`
+        const protocolTag = isHttp ? ' (HTTP)' : isBidirectional ? ' (Bidi v2)' : ''
+        const testLabel = `SSML ${ssmlData.index}/${ssmls.length}, Iter ${iter + 1}/${iterations}, ${getConfigLabel(config)}${protocolTag}${useDualEndpoints ? ` [${currentEndpoint ? new URL(currentEndpoint).host : region}]` : ''}`
         onProgress(completedTests, totalTests, testLabel)
 
         try {
           let synthesisResult: Omit<TestResult, 'ssmlIndex' | 'iteration' | 'timestamp' | 'isTargetEndpoint'>
 
           const httpEndpoint = getHttpEndpoint(config)
-          if (useHttpApi && httpEndpoint) {
-            // Use HTTP REST API (X-Microsoft-Provenance-Enabled header)
+          if (isHttp && httpEndpoint) {
+            // Use HTTP REST API (provenance via 'provenance' URL query parameter)
             synthesisResult = await synthesizeWithHttpApi(
               httpEndpoint,
               subscriptionKey,
               ssmlData.ssml,
               outputFormat,
               config.provenanceMode,
+              config.flightEnabled,
               signal
             )
           } else {
-            // Use WebSocket SDK (provenance via 'provenance' URL query parameter)
-            let speechConfig: SpeechSDK.SpeechConfig
-            
-            // Build endpoint URL with provenance parameter directly in the URL
-            // because JS SDK's setServiceProperty may not add params to WebSocket URL
-            if (currentEndpoint) {
-              const endpointUrl = new URL(currentEndpoint)
-              if (config.flightEnabled) {
-                endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
-              }
-              if (config.provenanceMode !== undefined) {
-                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
-              }
-              console.log(`WebSocket endpoint with provenance: ${endpointUrl.toString()}`)
-              speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
-            } else {
-              // For region-based endpoint, we need to construct the WebSocket URL manually
-              const wsEndpoint = `wss://${region}.tts.speech.microsoft.com/cognitiveservices/websocket/v1`
-              const endpointUrl = new URL(wsEndpoint)
-              if (config.flightEnabled) {
-                endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
-              }
-              if (config.provenanceMode !== undefined) {
-                endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
-              }
-              console.log(`WebSocket endpoint with provenance: ${endpointUrl.toString()}`)
-              speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
+            // WebSocket-based synthesis: v1 (websocket) or v2 (bidirectional text stream).
+            // Provenance is passed via the 'provenance' URL query parameter because the
+            // JS SDK's setServiceProperty may not add params to the WebSocket URL.
+            const defaultPath = isBidirectional
+              ? '/tts/cognitiveservices/websocket/v2'
+              : '/cognitiveservices/websocket/v1'
+            const endpointUrl = currentEndpoint
+              ? new URL(currentEndpoint)
+              : new URL(`wss://${region}.tts.speech.microsoft.com${defaultPath}`)
+            if (config.flightEnabled) {
+              endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
             }
-
+            if (config.provenanceMode !== undefined) {
+              endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
+            }
+            console.log(`${isBidirectional ? 'Bidirectional v2' : 'WebSocket'} endpoint with provenance: ${endpointUrl.toString()}`)
+            const speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
             speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-            synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, config.provenanceMode, outputFormat)
+            if (isBidirectional) {
+              if (voiceName) {
+                speechConfig.speechSynthesisVoiceName = voiceName
+              }
+              const text = [ssmlData.primaryText, ssmlData.secondaryText].filter(Boolean).join(' ')
+              synthesisResult = await synthesizeWithBidirectional(speechConfig, text, config.provenanceMode, outputFormat)
+            } else {
+              synthesisResult = await synthesizeWithLatencyTracking(speechConfig, ssmlData.ssml, config.provenanceMode, outputFormat)
+            }
           }
 
           const result: TestResult = {
@@ -360,6 +446,7 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
             iteration: iter + 1,
             isTargetEndpoint: config.isTarget,
             ...synthesisResult,
+            provenanceMode: config.provenanceMode,
             timestamp: new Date().toISOString(),
           }
 
@@ -375,6 +462,7 @@ export async function runPerformanceTest(options: RunTestOptions): Promise<TestR
             ssmlIndex: ssmlData.index,
             iteration: iter + 1,
             provenanceEnabled: config.provenanceMode === true,
+            provenanceMode: config.provenanceMode,
             isTargetEndpoint: config.isTarget,
             success: false,
             error: error.message,
@@ -410,12 +498,16 @@ interface WarmupOptions {
   useDualEndpoints?: boolean  // Use different endpoints for Base vs Target
   region: string | null
   outputFormat: string
+  protocol?: Protocol  // Synthesis protocol (default 'websocket')
+  voiceName?: string  // Voice name, required for bidirectional text streaming (v2)
   onLog: (message: string) => void
   signal: AbortSignal
 }
 
 export async function runWarmup(options: WarmupOptions): Promise<void> {
-  const { ssml, warmupRuns, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, onLog, signal } = options
+  const { ssml, warmupRuns, subscriptionKey, endpoint, baseEndpoint, targetEndpoint, targetProvenanceEnabled, targetFlightEnabled = false, useDualEndpoints = false, region, outputFormat, protocol = 'websocket', voiceName, onLog, signal } = options
+
+  const isBidirectional = protocol === 'bidirectional'
 
   // Convert null to undefined for provenanceMode (null means use server default)
   const targetProvenanceMode: ProvenanceMode = targetProvenanceEnabled ?? undefined
@@ -446,34 +538,33 @@ export async function runWarmup(options: WarmupOptions): Promise<void> {
       }
 
       try {
-        let speechConfig: SpeechSDK.SpeechConfig
         const currentEndpoint = config.endpoint
-        
+        const defaultPath = isBidirectional
+          ? '/tts/cognitiveservices/websocket/v2'
+          : '/cognitiveservices/websocket/v1'
+
         // Build endpoint URL with provenance parameter directly
-        if (currentEndpoint) {
-          const endpointUrl = new URL(currentEndpoint)
-          if (config.flightEnabled) {
-            endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
-          }
-          if (config.provenanceMode !== undefined) {
-            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
-          }
-          speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
-        } else {
-          const wsEndpoint = `wss://${region}.tts.speech.microsoft.com/cognitiveservices/websocket/v1`
-          const endpointUrl = new URL(wsEndpoint)
-          if (config.flightEnabled) {
-            endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
-          }
-          if (config.provenanceMode !== undefined) {
-            endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
-          }
-          speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
+        const endpointUrl = currentEndpoint
+          ? new URL(currentEndpoint)
+          : new URL(`wss://${region}.tts.speech.microsoft.com${defaultPath}`)
+        if (config.flightEnabled) {
+          endpointUrl.searchParams.set(SETFEATURE_QUERY_PARAM, PROVENANCE_FLIGHT_NAME)
         }
+        if (config.provenanceMode !== undefined) {
+          endpointUrl.searchParams.set(PROVENANCE_QUERY_PARAM, config.provenanceMode ? 'true' : 'false')
+        }
+        const speechConfig = SpeechSDK.SpeechConfig.fromEndpoint(endpointUrl, subscriptionKey)
 
         speechConfig.speechSynthesisOutputFormat = OUTPUT_FORMAT_MAP[outputFormat] || SpeechSDK.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
 
-        await synthesizeWithLatencyTracking(speechConfig, ssml, config.provenanceMode, outputFormat)
+        if (isBidirectional) {
+          if (voiceName) {
+            speechConfig.speechSynthesisVoiceName = voiceName
+          }
+          await synthesizeWithBidirectional(speechConfig, 'Warmup.', config.provenanceMode, outputFormat)
+        } else {
+          await synthesizeWithLatencyTracking(speechConfig, ssml, config.provenanceMode, outputFormat)
+        }
         const label = config.isTarget ? 'Target' : 'Base'
         const provLabel = config.provenanceMode === undefined ? 'default' : config.provenanceMode ? 'ON' : 'OFF'
         const endpointInfo = useDualEndpoints && currentEndpoint ? ` [${new URL(currentEndpoint).host}]` : ''
